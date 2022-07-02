@@ -1,6 +1,8 @@
 from bts.evaluation.simulate import simulate
 from bts.evaluation import metrics, visualize
 from bts.models.player_game.model import Baseline
+from bts.models.player_game.parametric import Logistic
+from bts.models.player_game.sequential import EloSystem
 import socket
 if 'swarm' in socket.gethostname():
     import matplotlib
@@ -68,7 +70,7 @@ def default_params():
 
 if __name__ == '__main__':
 
-    models = { 'baseline': Baseline() }
+    models = { 'baseline': Baseline(), 'logistic': Logistic(), 'elo': EloSystem() }
 
     description = 'simulate BTS model'
     formatter = argparse.ArgumentDefaultsHelpFormatter

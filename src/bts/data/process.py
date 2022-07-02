@@ -186,7 +186,7 @@ def atbats_from_pitches(pitches):
     return atbats
 
 def games_from_atbats(atbats):
-    cols = ['game_pk', 'game_date', 'year', 'batter_team', 'pitcher_team', 'ballpark', 'home', 'pitcher']
+    cols = ['game_pk', 'game_date', 'year', 'batter_team', 'pitcher_team', 'ballpark', 'home', 'pitcher', 'stand', 'p_throws']
     games = atbats.groupby(['game_pk', 'batter_team'], observed=True).head(1).reset_index()[cols]
     hits = atbats.groupby(['game_pk', 'batter_team', 'batter'],observed=True).hit.any().reset_index()
     return hits.merge(games, on=['game_pk', 'batter_team'])

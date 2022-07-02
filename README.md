@@ -6,14 +6,14 @@ This repository contains a test bed for evaluating different models for the MLB 
 
 Different models in this repostiroy may use different granularities of data.   All data is derived from pitch-level statcast data, obtained from [pybaseball](https://github.com/jldbc/pybaseball).  
 
-## Obtaining the data 
+### Obtaining the data 
 
 First, you must set an environmetn variable that says where the data will live.  If you are on Ubuntu or OS X, add this line to your .bashrc file.
 
 ```$BTSDATA=/path/to/bts/data```
 
 If you are on Windows, go to System --> Settings --> Advanced --> Environment Variables and add an envionrment variable "BTSDATA" that points to the directory where you want the data to live.  
-F
+
 This data can be obtained in two ways:
 
 1. **The Manual Way:**
@@ -22,7 +22,7 @@ TODO
 
 2. **The Quick Way:** The preprocessed data is available for download on [Google Drive](https://drive.google.com/file/d/1LXGdMoaFsyJnPQi8-ak1uz0TFOsC2bIH/view?usp=sharing).  Simply download the data, and extract it to the "$BTSDATA" directory.  
 
-## Understanding the data
+### Understanding the data
 
 There are three levels of granularity in the data, 
 
@@ -33,7 +33,7 @@ There are three levels of granularity in the data,
 3. The finest granularity of data contains information about every pitch thrown, including the outcome of the pitch and relevant context.  
 
 
-## Feature engineering
+### Feature engineering
 
 Some may be surprised that the data does not directly contain statisical information, such as the batting average of a given batter, the BA against the opposing pitcher, etc.  If desired, these statistics can easily be calculated from at-bat level data, however.  Since the statistics needed may vary by model, they should be computed within each model.  
 
@@ -51,6 +51,25 @@ To evaluate the model, we simulate the model running over 1 seasons worth of dat
 
 ```python main.py --model baseline --year 2019```
 
-## Notes
+### Notes
 
 Unlike in traditional ML settings, this evaluation is not a standard one time train/test split.  Instead, we use multiple train/test split, where the test set corresponds to one day's worth of data, and the training data is all data that preceded it.  This more faithfully represents the sequential nature of the problem . Since data from earlier in the same season can be highly relevant for predicting outcomes later in the season, it is important to include it in the training dataset.  
+
+
+# Results
+
+
+### (player, game) model
+
+
+
+### atbat model
+
+Below we show the (geometric) average likelihood of different models using different test sets.  
+
+| Model | 2016 | 2017 | 2018 | 2019 | 2020 | 2021 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Baseline | 0.5783 | 0.5783 | 0.5826 | 0.5801 | 0.5850 | 0.5849 |
+| Elo (Notebook) | 0.5849 | 0.5852 | 0.5896 | 0.5870 | 0.5928 | 0.5932 |
+| Logistic | 0.5852 | 0.5856 | 0.5900 | 0.5872 | 0.5929 | 0.5938 |
+| NeuralNet | - | - | - | 0.5857 | - | - |
