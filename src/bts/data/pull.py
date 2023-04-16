@@ -150,6 +150,6 @@ if __name__ == '__main__':
     start = parse_date(args.start)
     end = parse_date(args.end)
 
-    #download_statcast(start, end, base)
+    download_statcast(start, end, base)
     download_retrosheet(start, end, base)
-    #download_weather(start, end, base)
+    download_weather(start, end, base)
