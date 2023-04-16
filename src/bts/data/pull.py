@@ -9,6 +9,7 @@ import sys
 import pandas as pd
 from pybaseball import statcast
 from pybaseball.retrosheet import events
+import argparse
 
 def download_statcast(start, end, base):
     for day in pd.date_range(start, end):
@@ -105,7 +106,7 @@ def download_weather(start, end, base):
         stats = Hourly(p, start, end, timezone=tz)
         data = stats.fetch()
         data['ballpark'] = loc
-        data['lat'] locs[loc][0]
+        data['lat'] = locs[loc][0]
         data['lon'] = locs[loc][1]
         data['alt'] = alts[loc]
         data['timezone'] = tz
@@ -113,3 +114,42 @@ def download_weather(start, end, base):
 
     data = pd.concat(weather)
     data.to_csv(base + '/weather.csv')
+
+def parse_date(date):
+    return datetime.datetime.strptime(date, '%Y-%m-%d')
+
+def show_date(date):
+    return date.strftime('%Y-%m-%d')
+
+def default_params():
+    """
+    Return default parameters to run this program
+
+    :returns: a dictionary of default parameter settings for each command line argument
+    """
+    yesterday = show_date(pd.datetime.today() - datetime.timedelta(days=1))
+    params = {}
+    params['start'] = yesterday
+    params['end'] = yesterday
+
+    return params
+
+if __name__ == '__main__':
+
+    description = 'download data and store in appropriate folder'
+    formatter = argparse.ArgumentDefaultsHelpFormatter    
+    parser = argparse.ArgumentParser(description=description, formatter_class=formatter)
+    parser.add_argument('--start', help='start date (yyyy-mm-dd)')
+    parser.add_argument('--end', help='end date (yyyy-mm-dd)')
+
+    base = os.environ['BTSDATA']
+
+    parser.set_defaults(**default_params())
+    args = parser.parse_args()
+
+    start = parse_date(args.start)
+    end = parse_date(args.end)
+
+    #download_statcast(start, end, base)
+    download_retrosheet(start, end, base)
+    #download_weather(start, end, base)
