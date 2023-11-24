@@ -10,6 +10,7 @@ import pandas as pd
 from pybaseball import statcast
 from pybaseball.retrosheet import events
 import argparse
+from meteostat import Hourly, Point
 
 def download_statcast(start, end, base):
     for day in pd.date_range(start, end):
@@ -99,6 +100,7 @@ def download_weather(start, end, base):
              'ATL': 320.0243828101189,
              'CHC': 181.65193538555317}
 
+    weather = []
     for loc in locs.keys():
         print('Processing', loc)
         p = Point(*locs[loc], alts[loc])
@@ -127,7 +129,7 @@ def default_params():
 
     :returns: a dictionary of default parameter settings for each command line argument
     """
-    yesterday = show_date(pd.datetime.today() - datetime.timedelta(days=1))
+    yesterday = show_date(pd.Timestamp.today() - datetime.timedelta(days=1))
     params = {}
     params['start'] = yesterday
     params['end'] = yesterday
@@ -150,6 +152,6 @@ if __name__ == '__main__':
     start = parse_date(args.start)
     end = parse_date(args.end)
 
-    download_statcast(start, end, base)
+    #download_statcast(start, end, base)
     download_retrosheet(start, end, base)
-    download_weather(start, end, base)
+    #download_weather(start, end, base)
