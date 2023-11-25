@@ -17,6 +17,7 @@ BALLPARK_MAPPING = {
     "ANA": "LAA",
     "ARI": "ARI",
     "ATL": "ATL",
+    "AZ": "ARI",
     "BAL": "BAL",
     "BOS": "BOS",
     "CHA": "CWS",
@@ -101,7 +102,7 @@ def process_all_data(pattern="*"):
     # First we will load and lightly augment the pitches data, before further processing
     pitches = load_statcast(pattern)
 
-    print('Loaded and cleaned statcast data', time.time() - t0)
+    print("Loaded and cleaned statcast data", time.time() - t0)  # 128s
 
     # Now augment with player names.
     # Note: it is very important that pitches data and retrosheet data is
@@ -116,15 +117,14 @@ def process_all_data(pattern="*"):
     # and perform the join themselves.
     info, starters = load_retrosheet()
 
-
-    print('Loaded and cleaned retrosheet data', time.time() - t0)
+    print("Loaded and cleaned retrosheet data", time.time() - t0)  # 141s
 
     retrosheet_gameids = get_retrosheet_gameids(info, starters)
     retrosheet_gameids["home_starter"] = retrosheet_gameids.home_starter.map(
         player_lookup
     )
-    
-    print('Computed retrosheet game_ids', time.time() - t0)
+
+    print("Computed retrosheet game_ids", time.time() - t0)  # 141s
 
     # If pattern != * some nulls are expected here
     # assert retrosheet_gameids.home_starter.notnull().all()
@@ -132,22 +132,26 @@ def process_all_data(pattern="*"):
     joinable_retrosheet = make_retrosheet_joinable(
         info, statcast_gameids, retrosheet_gameids
     )
-
-    print('Computed statcast game_ids and make joinable retrosheet', time.time() - t0)
     
+    print("Computed statcast ids and join retrosheet", time.time() - t0) # 146s
 
     # Now get coarser grained views of the data
     atbats = atbats_from_pitches(pitches)
+    
+    print('Derived atbats from pitches', time.time() - t0)
+
     batter_games = games_from_atbats(atbats)
 
+    print('Derived batter/games from atbats', time.time() - t0)
+    
     # Now we will add lineup order information to the batter/games data
     statcast_lineups = lineups_from_statcast(pitches)
     batter_games = batter_games.merge(
         statcast_lineups, how="left", on=["game_pk", "batter"]
     )
     batter_games = batter_games[batter_games.order.notnull()]
-    
-    print('Derived atbats and batter/game data from pitch data', time.time() - t0)
+
+    print("Added lineup information to batter/games", time.time() - t0) # 766s
 
     return pitches, atbats, batter_games, joinable_retrosheet
 
@@ -258,6 +262,10 @@ def load_statcast(pattern="*"):
             continue
     df = pd.concat(dfs).astype(cols)
     df = df[df["game_type"] == "R"]
+    
+    # there should be 30 unique teams, but team abbreviations change over time.
+    df['home_team'] = df.home_team.map(BALLPARK_MAPPING).astype('category')
+    df['away_team'] = df.away_team.map(BALLPARK_MAPPING).astype('category')
 
     # Now apply some light cleanup
     df["spray_angle"] = np.arctan((df.hc_x - 125.42) / (198.27 - df.hc_y)) * 180 / np.pi
@@ -488,6 +496,8 @@ def atbats_from_pitches(pitches):
         "game_pk",
         "game_date",
         "game_year",
+        "home_team",
+        "away_team",
         "batter_team",
         "pitcher_team",
         "batter",
@@ -510,7 +520,7 @@ def atbats_from_pitches(pitches):
     ]
     atbats = pitches[pitches.events.isin(events)][cols]
     atbats["hit"] = atbats.events.isin(["single", "double", "triple", "home_run"])
-    return atbats
+    return atbats.sort_values(['game_date', 'game_pk'])
 
 
 def games_from_atbats(atbats):
@@ -536,7 +546,7 @@ def games_from_atbats(atbats):
         .hit.sum()
         .reset_index()
     )
-    return hits.merge(games, on=["game_pk", "batter_team"])
+    return hits.merge(games, on=["game_pk", "batter_team"]).sort_values(['game_date', 'game_pk'])
 
 
 def lineups_from_statcast(pitches):
@@ -547,8 +557,8 @@ def lineups_from_statcast(pitches):
         if num < 9:
             # This was observed to happen in a spring training game.
             # Culprit was NaN batters (probably due to invalid player_id mapping)
-            cols = ['game_date', 'game_pk', 'home_team', 'away_team']
-            print('Found funny game', num, game_team.iloc[0].loc[cols])
+            cols = ["game_date", "game_pk", "home_team", "away_team"]
+            print("Found funny game", num, game_team.iloc[0].loc[cols])
         result = pd.DataFrame(index=np.arange(num) + 1)
         result["batter"] = df.iloc[:num].values
         result.index.name = "order"

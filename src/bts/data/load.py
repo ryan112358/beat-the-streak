@@ -1,29 +1,21 @@
 import pandas as pd
 import os
+import functools
 
 ROOT = os.environ['BTSDATA']
 
-def load_data():
-    """
-    Load (player, game) data from the processed pickle file
-    """
-    return pd.read_parquet(f'{ROOT}/data.parquet.gzip')
+def read_parquet(name):
+    return pd.read_parquet(f'{ROOT}/{name}.parquet.gzip')
 
-def load_atbats():
-    """
-    Load atbat data from the processed pickle file
-    """
-    return pd.read_parquet(f'{ROOT}/atbats.parquet.gzip')
+load_data = functools.partial(read_parquet, 'data')
+load_atbats = functools.partial(read_parquet, 'atbats')
+load_pitches = functools.partial(read_parquet, 'pitches')
 
-def load_pitches():
-    """
-    Load pitch data from the processed pickle file
-    """
-    return pd.read_parquet(f'{ROOT}/pitches.parquet.gzip')
-
-def load_weather():
-    """
-    Load weather data.
-    """
-    return pd.read_csv(f'{ROOT}/weather/weather.csv')
+def load_engineered_features():
+    feature_types = ['batter', 'pitcher', 'ballpark', 'batter_team']
+    features = []
+    for join_key in feature_types:
+        name = '%s_features' % join_key
+        features.append(([join_key, 'game_date'], read_parquet(name)))
+    return features
 
