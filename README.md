@@ -4,7 +4,7 @@ This repository contains a test bed for evaluating different models for the MLB 
 
 # The data
 
-Different models in this repostiroy may use different granularities of data.   All data is derived from pitch-level statcast data, obtained from [pybaseball](https://github.com/jldbc/pybaseball).  
+Different models in this repository may use different granularities of data.   All data is derived from pitch-level statcast data, obtained from [pybaseball](https://github.com/jldbc/pybaseball).  
 
 ### Obtaining the data 
 
@@ -14,13 +14,31 @@ First, you must set an environmetn variable that says where the data will live. 
 
 If you are on Windows, go to System --> Settings --> Advanced --> Environment Variables and add an envionrment variable "BTSDATA" that points to the directory where you want the data to live.  
 
-This data can be obtained in two ways:
-
 1. **The Manual Way:**
 
-TODO
+The first step is to "pull", or download the data.  Navigate to ```src/bts/data``` and run
 
-2. **The Quick Way:** The preprocessed data is available for download on [Google Drive](https://drive.google.com/file/d/1LXGdMoaFsyJnPQi8-ak1uz0TFOsC2bIH/view?usp=sharing).  Simply download the data, and extract it to the "$BTSDATA" directory.  
+```
+$ python pull.py --source retrosheet --start 2010-01-01 --end 2010-12-31
+$ python pull.py --source statcast --start 2010-01-01 --end 2010-12-31
+```
+
+This will download all statcast and retrosheet data for 2010 and dump it to your ```$BTSDATA``` directory.  This will take a while, so it's best to let it run in the background while you do something else.  
+
+The data currently exists as a set of csv files, one per date.  The second step is to load these in, clean and aggregate them, an dump them back out to the ```$BTSDATA``` directory.
+
+```
+$ python process.py
+```
+
+should do the trick.  After doing these two steps, if you want to load data in the future, you can use:
+
+```python
+>>> from bts.data.load import load_data, load_atbats
+
+>>> data = load_data()  # batter/game data
+>>> atbtas = load_atbats()  # atbat data
+```
 
 ### Understanding the data
 
@@ -61,6 +79,7 @@ Unlike in traditional ML settings, this evaluation is not a standard one time tr
 
 ### (player, game) model
 
+Results are available at this [Google Sheet](https://docs.google.com/spreadsheets/d/10TmsPNHuWNbhQiL_0QaIlKTaAfK8i5i0O-XNKUFv23Y/edit?usp=sharing).
 
 
 ### atbat model
