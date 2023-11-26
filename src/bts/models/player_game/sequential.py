@@ -76,13 +76,12 @@ class EloSystem(model.Model):
 
         ebat = 1.0 / (1.0 + np.exp(-diff))
         sbat = data.hit.values.astype(float)
-        bup = pd.Series(data=sbat-ebat, index=bats).groupby('batter').sum()
+        bup = pd.Series(data=sbat-ebat, index=bats).groupby('batter', observed=True).sum()
 
         df = pd.DataFrame()
         df['pitcher'] = pits.values
         df['dpit'] = ebat - sbat
-        pup = df.groupby('pitcher').dpit.sum()
-
+        pup = df.groupby('pitcher', observed=True).dpit.sum() 
         self.belo = self.belo.add(self.k_factor*bup, fill_value=0)
         self.pelo = self.pelo.add(self.k_factor*pup, fill_value=0)
     

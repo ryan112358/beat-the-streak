@@ -1,3 +1,4 @@
+import jax
 from bts.models.player_game import model, utility
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import OneHotEncoder
@@ -9,6 +10,12 @@ from pandas.api.types import CategoricalDtype
 import scipy
 from scipy import sparse
 import pickle
+from bts.data.load import load_engineered_features
+from bts.models import neural_network
+from jax import config
+import jax.numpy as jnp
+
+config.update('jax_enable_x64', True)
 
 def onehot(data, mincount=50):
     cats = []
@@ -83,7 +90,7 @@ class SKLearn(model.Model):
         self.X = scipy.sparse.vstack([self.X, X])
         self.y = np.append(self.y, y)
 
-        dates = self.dates.append(pd.to_datetime(data.game_date))
+        dates = pd.concat([self.dates, data.game_date])
         self.dates = dates
         deltas = (dates.max() - dates).dt.days
         weights = self.alpha**deltas.values
@@ -117,3 +124,69 @@ def XGBoost(alpha=0.9995):
     name = 'XGBoost_' + str(alpha)
     return SKLearn(model, alpha, name)
 
+
+class Singlearity(model.Model):
+    def __init__(self, name='Singlearity'):
+        self.model = neural_network.FullyConnectedNeuralNetwork()
+        self.name = name
+        self.base_features = ['home', 'game_year', 'order', 'stand', 'p_throws']
+        self.engineered = load_engineered_features()
+        self.Xmean = None
+        self.Xstd = None
+
+    def _feature_join(self, data):
+        merged = data
+        for join_key, table in self.engineered:
+            merged = merged.merge(table, on=join_key, how='left')
+        return merged
+
+    def fit(self, steps):
+        for i, rng in enumerate(jax.random.split(self.rng, steps)):
+            grads, loss, mean_hits, accuracy, pred = neural_network.apply_model(self.state, self.X, self.y, {'dropout': rng})
+            self.state = neural_network.update_model(self.state, grads)
+            if i % 50 == 0:
+                print(loss, mean_hits, accuracy, jnp.isnan(pred).any())
+        self.rng = rng
+
+    def get_Xy(self, data):       
+        merged = self._feature_join(data)
+        basic = pd.get_dummies(merged[self.base_features])
+        engineered = merged.filter(regex='1095|365|30|60')
+        df = pd.concat([basic, engineered], axis=1)
+        idx = merged.game_year >= 2003
+        # from IPython import embed; embed()
+        X = df[idx].values.astype(float)
+        y = merged[idx].hit.values.astype(float)
+        if self.Xstd is None:
+            Xmean = X.mean(axis=0)
+            Xstd = X.std(axis=0)
+            self.Xindex = Xstd > 0
+            self.Xstd = Xstd[self.Xindex]
+            self.Xmean = Xmean[self.Xindex]
+        X = (X[:,self.Xindex] - self.Xmean) / self.Xstd
+        return X, y
+
+    def summary(self):
+        return None
+
+    def train(self, data, atbats=None, pitches=None):
+        self.X, self.y = self.get_Xy(data)
+        self.rng = jax.random.PRNGKey(0)
+        self.state = neural_network.create_train_state(self.model, self.rng, self.X)
+        self.fit(8000)
+        
+ 
+    def update(self, data, atbats=None, pitches=None):
+        X, y = self.get_Xy(data)
+        self.X = np.vstack([self.X, X])
+        self.y = np.append(self.y, y)
+        self.fit(250)
+    
+    def predict(self, data):
+        X, _ = self.get_Xy(data)
+        params = {'params': self.state.params}
+        pred = self.model.apply(params, X, train=False).flatten()
+        return pd.Series(data=pred, index=data.batter.values)
+
+    def __str__(self):
+        return self.name
