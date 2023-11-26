@@ -2,6 +2,21 @@
 
 This repository contains a test bed for evaluating different models for the MLB Beat the Streak contest.  
 
+# Setting up your environment
+
+To run the code in this repository, download and install python3.12 and run
+
+```
+$ python3.12 -m venv ~/virtualenvs/bts/
+$ source ~/virtualenvs/bts/bin/activate
+$ pip install --upgrade pip
+$ pip install --upgrade numpy scipy pandas scikit-learn jupyter matplotlib meteostat xgboost lightgbm
+$ pip install jax --upgrade "jax[cpu]"
+$ pip install flax
+```
+
+The instructions may work with other versions of python as well.  You can also reference the exact requirements.txt file for depenendency versions if desired.
+
 # The data
 
 Different models in this repository may use different granularities of data.   All data is derived from pitch-level statcast data, obtained from [pybaseball](https://github.com/jldbc/pybaseball).  
