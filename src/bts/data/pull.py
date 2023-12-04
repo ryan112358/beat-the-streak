@@ -133,6 +133,7 @@ def default_params():
     params = {}
     params['start'] = yesterday
     params['end'] = yesterday
+    params['source'] = 'statcast'
 
     return params
 
@@ -141,6 +142,7 @@ if __name__ == '__main__':
     description = 'download data and store in appropriate folder'
     formatter = argparse.ArgumentDefaultsHelpFormatter    
     parser = argparse.ArgumentParser(description=description, formatter_class=formatter)
+    parser.add_argument('--source', choices=['statcast', 'retrosheet', 'weather'], help='data source to download')
     parser.add_argument('--start', help='start date (yyyy-mm-dd)')
     parser.add_argument('--end', help='end date (yyyy-mm-dd)')
 
@@ -152,6 +154,9 @@ if __name__ == '__main__':
     start = parse_date(args.start)
     end = parse_date(args.end)
 
-    #download_statcast(start, end, base)
-    download_retrosheet(start, end, base)
-    #download_weather(start, end, base)
+    if args.source == 'statcast':
+        download_statcast(start, end, base)
+    if args.source == 'retrosheet':
+        download_retrosheet(start, end, base)
+    if args.source == 'weather':
+        download_weather(start, end, base)

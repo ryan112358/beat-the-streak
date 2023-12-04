@@ -28,7 +28,7 @@ def process_results(results, folder, stdout=True):
     plt.savefig(folder + "/success_distribution.png")
     visualize.success_curve(results)
     plt.savefig(folder + "/success_curve.png")
-    visualize.calibration_curve(results, bucket_sizes=[100, 250, 1000])
+    visualize.calibration_curve(results, bucket_sizes=[500])
     plt.savefig(folder + "/calibration_curve.png")
     plt.close('all')
 
@@ -80,7 +80,7 @@ if __name__ == "__main__":
         "baseline": Baseline(),
         "logistic": Logistic(),
         "elo": EloSystem(),
-        "singlearity": Singlearity(),
+        "singlearity": Singlearity(0.001),
     }
 
     description = "simulate BTS model"

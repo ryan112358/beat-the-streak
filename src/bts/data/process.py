@@ -132,18 +132,18 @@ def process_all_data(pattern="*"):
     joinable_retrosheet = make_retrosheet_joinable(
         info, statcast_gameids, retrosheet_gameids
     )
-    
-    print("Computed statcast ids and join retrosheet", time.time() - t0) # 146s
+
+    print("Computed statcast ids and join retrosheet", time.time() - t0)  # 146s
 
     # Now get coarser grained views of the data
     atbats = atbats_from_pitches(pitches)
-    
-    print('Derived atbats from pitches', time.time() - t0)
+
+    print("Derived atbats from pitches", time.time() - t0)
 
     batter_games = games_from_atbats(atbats)
 
-    print('Derived batter/games from atbats', time.time() - t0)
-    
+    print("Derived batter/games from atbats", time.time() - t0)
+
     # Now we will add lineup order information to the batter/games data
     statcast_lineups = lineups_from_statcast(pitches)
     batter_games = batter_games.merge(
@@ -151,7 +151,7 @@ def process_all_data(pattern="*"):
     )
     batter_games = batter_games[batter_games.order.notnull()]
 
-    print("Added lineup information to batter/games", time.time() - t0) # 766s
+    print("Added lineup information to batter/games", time.time() - t0)  # 766s
 
     return pitches, atbats, batter_games, joinable_retrosheet
 
@@ -251,21 +251,30 @@ def load_statcast(pattern="*"):
         "zone": "category",
     }
 
+    # We want to read in categories as strings (in particular: zone)
+    dtype_read = {k: str if v in ["datetime64[ns]", "category"] else v for k, v in cols.items()}
+    # These should also ideally be read in as string, but retrosheet loads them as floats
+    dtype_read['batter'] = float
+    dtype_read['pitcher'] = float
+
     files = glob.glob(f"{ROOT}/{pattern}/")
     dfs = []
-    for f in files:
+    for f in sorted(files):
         try:
             # We only load in the columns we need for space efficiency
-            dfs.append(pd.read_csv(f + "statcast.csv", usecols=list(cols)))
+            dfs.append(
+                pd.read_csv(f + "statcast.csv", usecols=list(cols), dtype=dtype_read)
+            )
         except:
             # Some files do not have the header, which causes exceptions.
             continue
+
     df = pd.concat(dfs).astype(cols)
     df = df[df["game_type"] == "R"]
-    
+
     # there should be 30 unique teams, but team abbreviations change over time.
-    df['home_team'] = df.home_team.map(BALLPARK_MAPPING).astype('category')
-    df['away_team'] = df.away_team.map(BALLPARK_MAPPING).astype('category')
+    df["home_team"] = df.home_team.map(BALLPARK_MAPPING).astype("category")
+    df["away_team"] = df.away_team.map(BALLPARK_MAPPING).astype("category")
 
     # Now apply some light cleanup
     df["spray_angle"] = np.arctan((df.hc_x - 125.42) / (198.27 - df.hc_y)) * 180 / np.pi
@@ -517,10 +526,14 @@ def atbats_from_pitches(pitches):
         "if_fielding_alignment",
         "of_fielding_alignment",
         "home",
+        "estimated_ba_using_speedangle",
     ]
     atbats = pitches[pitches.events.isin(events)][cols]
     atbats["hit"] = atbats.events.isin(["single", "double", "triple", "home_run"])
-    return atbats.sort_values(['game_date', 'game_pk'])
+    atbats["ehit"] = atbats.estimated_ba_using_speedangle.fillna(
+        atbats.hit.astype(float)
+    )
+    return atbats.sort_values(["game_date", "game_pk"])
 
 
 def games_from_atbats(atbats):
@@ -542,11 +555,15 @@ def games_from_atbats(atbats):
         .reset_index()[cols]
     )
     hits = (
-        atbats.groupby(["game_pk", "batter_team", "batter"], observed=True)
-        .hit.sum()
+        atbats.groupby(["game_pk", "batter_team", "batter"], observed=True)[
+            ["hit", "ehit"]
+        ]
+        .sum()
         .reset_index()
     )
-    return hits.merge(games, on=["game_pk", "batter_team"]).sort_values(['game_date', 'game_pk'])
+    return hits.merge(games, on=["game_pk", "batter_team"]).sort_values(
+        ["game_date", "game_pk"]
+    )
 
 
 def lineups_from_statcast(pitches):
