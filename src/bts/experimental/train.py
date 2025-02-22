@@ -1,12 +1,13 @@
 import jax
 import jax.numpy as jnp
 import argparse
-from bts.models import transformer
+from bts.models import transformer, losses
 from bts.data import load
 import pandas as pd
 import numpy as np
 from flax import nnx
 import optax
+import IPython
 
 #jax.config.update("jax_debug_nans", True)
 #jax.config.update("jax_enable_x64", True)
@@ -33,6 +34,8 @@ NUMERICAL_COLUMNS = [
     'plate_z'
 ]
 
+PITCH_CONTEXT = ['pitch_number']
+
 def pad_or_truncate(arrays, m, pad_value):
     # Pads or truncates a list of arrays of a_1, ..., a_n of size m_i x p.
     n = len(arrays)
@@ -49,8 +52,9 @@ def pad_or_truncate(arrays, m, pad_value):
     return result
 
 
-def load_sequences():
-    pitches = load.load_pitches(columns=['pitcher', 'pitch_type'] + NUMERICAL_COLUMNS)
+def load_sequences() -> losses.InputData:
+    columns = ['pitcher', 'pitch_type'] + NUMERICAL_COLUMNS + PITCH_CONTEXT
+    pitches = load.load_pitches(columns=columns)
     # this allows plate_x and plate_y to be nan
     subset = pitches.dropna(subset='pitch_type')
 
@@ -58,14 +62,28 @@ def load_sequences():
     tmp = subset[NUMERICAL_COLUMNS]
     subset.loc[:,NUMERICAL_COLUMNS] = (tmp - tmp.mean()) / tmp.std()
 
-    ptypes = subset.groupby('pitcher', observed=True)['pitch_type'].apply(lambda g: np.array(g.cat.codes.values)[:,None])
-    plocs = subset.groupby('pitcher', observed=True)[NUMERICAL_COLUMNS].apply(np.array)
+    groups = subset.groupby('pitcher', observed=True)
 
+    ptypes = groups['pitch_type'].apply(lambda g: np.array(g.cat.codes.values)[:,None])
+    plocs = groups[NUMERICAL_COLUMNS].apply(np.array)
+    pitch_in_atbat = groups['pitch_number'].apply(lambda x: np.array(x-1)[:,None])
+
+    # only padded values should be -1 here.  There should be no other missing values
     ptypes = pad_or_truncate(ptypes.values, 400, pad_value=-1)[:,:,0]
+    pitch_in_atbat = pad_or_truncate(pitch_in_atbat.values, 400, pad_value=-1)[:,:,0]
     plocs = pad_or_truncate(plocs.values, 400, pad_value=-128)
 
     type_missing_mask = ptypes != -1
     loc_missing_mask = plocs != -128
+
+
+    return losses.InputData(
+        pitch_types=ptypes,
+        pitch_features=plocs,
+        type_missing_mask=type_missing_mask,
+        feature_missing_mask=loc_missing_mask,
+        pitch_in_atbat=pitch_in_atbat
+    )
 
     return ptypes, plocs, type_missing_mask, loc_missing_mask
 
@@ -82,7 +100,7 @@ def default_params():
     params["num_layers"] = 4
     params["num_heads"] = 4
     params["iterations"] = 1000
-    params["batch_size"] = 64
+    params["batch_size"] = 8
     params["mixture_components"] = 8
 
     return params
@@ -103,30 +121,30 @@ if __name__ == "__main__":
     parser.set_defaults(**default_params())
     args = parser.parse_args()
 
-    ptypes, plocs, type_missing_mask, loc_missing_mask = load_sequences()
+    data = load_sequences()
 
     model = transformer.Transformer(
         seq_len=args.seq_len,
         hidden_dim=args.hidden_dim,
-        num_numerical_features=plocs.shape[-1],
+        num_numerical_features=data.pitch_features.shape[-1],
         mixture_components=args.mixture_components,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
-        vocab_size=ptypes.max() + 1,
+        vocab_size=data.pitch_types.max() + 1,
     )
 
+    params = nnx.state(model, nnx.Param)
+    total_params = sum(x.size for x in jax.tree.leaves(params))
+    print('Model Size: %.2f M' % (total_params / 10**6))
+
+
     optimizer = nnx.Optimizer(model, optax.adamw(1e-4, 0.9))
-    BATCH_SIZE = args.batch_size
     type_loss = real_loss = 0
     for t in range(args.iterations):
-        idx = np.random.choice(ptypes.shape[0], size=BATCH_SIZE)
         tl, rl = transformer.train_step(
                 model, 
                 optimizer, 
-                ptypes[idx], 
-                plocs[idx],
-                type_missing_mask[idx],
-                loc_missing_mask[idx],
+                data.sample(args.batch_size)
         )
         type_loss += tl; real_loss += rl
         if t % 100 == 99:

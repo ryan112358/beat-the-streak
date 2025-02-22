@@ -1,9 +1,74 @@
-# Loss functions, specifically for transformer-shaped arrays with leading dimensions
-# (BATCH_SIZE, SEQUENCE_LENGTH)
+"""Loss functions specialized for transformer-based next-pitch prediction.
+
+Notation:
+    - B = BATCH_SIZE
+    - S = SEQUENCE_LENGTH
+    - F = NUMERICAL_FEATURES
+    - M = MIXTURE_COMPONENTS 
+    - V = VOCAB_SIZE (number of possible pitch types)
+    - H = HIDDEN_DIMENSIONALITY
+"""
 import jax
 from flax import nnx
 import optax
 import jax.numpy as jnp
+from typing import Any
+import chex
+import numpy as np
+
+
+@chex.dataclass
+class InputData:
+    # features to be predicted
+    pitch_types: jax.Array  # (B, S)
+    pitch_features: jax.Array  # (B, S, F)
+
+    # entries of pitch_types/features to ignore (due to padding or missing data)
+    type_missing_mask: jax.Array  # (B, S)
+    feature_missing_mask: jax.Array  # (B, S, F)
+
+    # to be used as context for each pitch
+    pitch_in_atbat: jax.Array | None = None # (B, S)
+
+    def sample(self, batch_size: int) -> 'InputData':
+        idx = np.random.choice(self.pitch_types.shape[0], size=batch_size)
+        return jax.tree.map(lambda x: x[idx], self)
+
+
+@chex.dataclass
+class OutputDistribution:
+    """We model the pitch type distribution as a simple categorical
+    distribution, and we model the pitch features distribution as
+    a mixture of Gaussians.  This dataclass stores the parametrs of
+    these distributions.
+    """
+    # for predicting pitch type
+    logits: jax.Array  # (B, S, V)
+
+    # for predicting pitch features
+    mixture_weights: jax.Array  # (B, S, M)
+    mixture_means: jax.Array  # (B, S, M*F)
+    mixture_variances: jax.Array  # (B, S, M*F)
+
+
+def loss_fn(prediction: OutputDistribution, batch: InputData) -> tuple[float, Any]:
+
+    ptypes = batch.pitch_types[:, 1:]
+    plocs = batch.pitch_features[:, 1:]
+    type_missing_mask = batch.type_missing_mask[:, 1:]
+    loc_missing_mask = batch.feature_missing_mask[:, 1:]
+
+    logits = prediction.logits[:, :-1]
+    weights = prediction.mixture_weights[:, :-1]
+    means = prediction.mixture_means[:, :-1]
+    variances = prediction.mixture_variances[:, :-1]
+
+    type_loss = masked_crossentropy(logits, ptypes, type_missing_mask)
+    real_loss = mixture_density_loss(
+        weights, means, variances, plocs, loc_missing_mask
+    )
+    return 5 * type_loss + real_loss, (type_loss, real_loss)
+
 
 
 def _logpdf_with_missing(

@@ -1,3 +1,14 @@
+"""Transformer models specialized for next-pitch prediction.
+
+Notation:
+    - B = BATCH_SIZE
+    - S = SEQUENCE_LENGTH
+    - F = NUMERICAL_FEATURES
+    - M = MIXTURE_COMPONENTS 
+    - V = VOCAB_SIZE (number of possible pitch types)
+    - H = HIDDEN_DIMENSIONALITY
+"""
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -51,18 +62,13 @@ class TransformerBlock(nnx.Module):
         self.linear2 = nnx.Linear(
             in_features=4 * hidden_dim, out_features=hidden_dim, dtype=dtype, rngs=rngs
         )
-        self.dropout = nnx.Dropout(
-            rate=dropout_rate, rngs=rngs
-        )
+        self.dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
 
     def __call__(self, x: jax.Array, mask=None, deterministic=False):
         """Compute forward activations through a transformer block.
 
         Args:
-            x: An array of shape (B, S, H) where
-                B is the batch size
-                S is the sequence length
-                H is the hidden dimensionality
+            x: An array of shape (B, S, H)
             mask: An optional attention mask of shape (B, 1, S, S).
                 `mask[i, j]` is 1 when attention from token `i` to token `j` is allowed,
                 and 0 otherwise.  For causal attention, use `nnx.make_causal_mask(x)`.
@@ -132,6 +138,9 @@ class Transformer(nnx.Module):
             dtype=dtype,
             rngs=rngs,
         )
+        self.pitch_in_ab_embed = nnx.Embed(
+            num_embeddings=10, features=hidden_dim, rngs=rngs
+        )
         self.position_embed = nnx.Embed(
             num_embeddings=seq_len, features=hidden_dim, rngs=rngs
         )
@@ -160,7 +169,7 @@ class Transformer(nnx.Module):
             dtype=dtype,
             rngs=rngs,
         )
-        self.numeric_final_stddevs = nnx.Linear(
+        self.numeric_final_variances = nnx.Linear(
             in_features=hidden_dim,
             out_features=mixture_components * num_numerical_features,
             dtype=dtype,
@@ -169,57 +178,44 @@ class Transformer(nnx.Module):
 
     def __call__(
         self,
-        pitch_types: jax.Array,
-        pitch_locs: jax.Array,
+        batch: losses.InputData,
         mask=None,
         deterministic=False,
-    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    ) -> losses.OutputDistribution:
         """Compute forward pass for the Transformer model.
 
         Args:
-            pitch_types: An array of shape (B, S) representing categorical input features (e.g., pitch types).
-                B is the batch size, S is the sequence length.
-            pitch_locs: An array of shape (B, S, F) representing numerical input features (e.g., pitch locations).
-                F is the number of numerical features.
+            batch: The input data, including pitch types, features, and context.
             mask: Optional attention mask, will be a causal mask if not provided.
             deterministic: Whether to disable dropout.
 
         Returns:
-            A tuple containing:
-              - logits: Categorical logits for pitch type prediction, shape (B, S, vocab_size).
-              - weights: Mixture weights for numerical feature prediction, shape (B, S, mixture_components).
-              - means: Mixture means for numerical feature prediction, shape (B, S, mixture_components * num_numerical_features).
-              - stddevs: Mixture standard deviations for numerical feature prediction, shape (B, S, mixture_components * num_numerical_features).
-
-        The output is designed for a mixture density network. 'weights', 'means', and 'stddevs'
-        parameterize a mixture of Gaussians used to model the distribution of the numerical features.
-        'logits' are for categorical classification of pitch types.
+            The predicted output distribution for each pitch in the sequence. 
         """
         if mask is None:
-            mask = nnx.make_causal_mask(pitch_types)
+            mask = nnx.make_causal_mask(batch.pitch_types)
         x = (
-            self.type_embed(pitch_types)
-            + self.loc_embed(pitch_locs)
+            self.type_embed(batch.pitch_types)
+            + self.loc_embed(batch.pitch_features)
             + self.position_embed(jnp.arange(self.seq_len)[None])
+            #+ self.pitch_in_ab_embed(jnp.minimum(batch.pitch_in_atbat, 9))
         )
         for layer in self.blocks:
             x = layer(x, mask, deterministic)
-        # TODO: can the mixture components depend on the observed pitch types?
-        logits = self.type_final_logits(x)
-        weights = nnx.softmax(self.numeric_final_weights(x))
-        means = self.numeric_final_means(x)
-        stddevs = nnx.relu(self.numeric_final_stddevs(x)) + 0.001
-        return logits, weights, means, stddevs
 
+        # TODO: can the mixture components depend on the observed pitch types?
+        return losses.OutputDistribution(
+            logits = self.type_final_logits(x),
+            mixture_weights = nnx.softmax(self.numeric_final_weights(x)),
+            mixture_means = self.numeric_final_means(x),
+            mixture_variances = nnx.relu(self.numeric_final_variances(x)) + 0.001
+        )
 
 @nnx.jit
 def train_step(
     model: Transformer,
     optimizer: nnx.Optimizer,
-    ptypes: jax.Array,
-    plocs: jax.Array,
-    type_missing_mask: jax.Array,
-    loc_missing_mask: jax.Array,
+    batch: losses.InputData,
 ) -> tuple[float, float]:
     """Performs a single training step.
 
@@ -229,36 +225,15 @@ def train_step(
     Args:
         model: The Transformer model.
         optimizer: The Optax optimizer.
-        ptypes: Batch of pitch types.
-        plocs: Batch of pitch locations.
-        type_missing_mask: Mask for missing pitch type data.
-        loc_missing_mask: Mask for missing pitch location data.
+        batch: Batch of pitches.
 
     Returns:
         aux: Auxiliary information from the loss function (e.g., type_loss, real_loss).
     """
 
-    def loss_fn(model, ptypes, plocs, type_missing_mask, loc_missing_mask):
-        logits, weights, means, stddevs = model(ptypes, plocs)
+    def loss_fn(model, batch):
+        return losses.loss_fn(model(batch), batch)
 
-        ptypes = ptypes[:, 1:]
-        plocs = plocs[:, 1:]
-        type_missing_mask = type_missing_mask[:, 1:]
-        loc_missing_mask = loc_missing_mask[:, 1:]
-
-        logits = logits[:, :-1]
-        weights = weights[:, :-1]
-        means = means[:, :-1]
-        stddevs = stddevs[:, :-1]
-
-        type_loss = losses.masked_crossentropy(logits, ptypes, type_missing_mask)
-        real_loss = losses.mixture_density_loss(
-            weights, means, stddevs, plocs, loc_missing_mask
-        )
-        return 5 * type_loss + real_loss, (type_loss, real_loss)
-
-    (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(
-        model, ptypes, plocs, type_missing_mask, loc_missing_mask
-    )
+    (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model, batch)
     optimizer.update(grads)
     return aux
