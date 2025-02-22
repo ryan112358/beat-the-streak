@@ -10,6 +10,12 @@ from bts.models.player_game import model, sequential
 from bts.data.load import load_data, load_atbats
 
 
+def pretrain_model(model, data, atbats, pitches, test_year):
+    ab_train = atbats[atbats.game_year < test_year] if atbats is not None else None
+    p_train = pitches[pitches.game_year < test_year] if pitches is not None else None
+    train = data[data.game_year < test_year]
+    model.train(train, ab_train, p_train)
+
 def simulate(
     model: model.Model,
     data: pd.DataFrame,
@@ -35,8 +41,8 @@ def simulate(
     
     returns The predicted hit probability for each entry in data.
     """
-    ab_train = atbats[atbats.game_year < test_year] if atbats is not None else None
-    p_train = pitches[pitches.game_year < test_year] if pitches is not None else None
+    #ab_train = atbats[atbats.game_year < test_year] if atbats is not None else None
+    #p_train = pitches[pitches.game_year < test_year] if pitches is not None else None
     if atbats is not None:
         ab_test = atbats[atbats.game_year == test_year]
         ab_groups = ab_test.groupby("game_date")
@@ -44,17 +50,24 @@ def simulate(
         p_test = pitches[pitches.game_year == test_year]
         p_groups = p_test.groupby("game_date")
 
-    train = data[data.game_year < test_year]
+    #train = data[data.game_year < test_year]
     test = data[data.game_year == test_year]
-    model.train(train, ab_train, p_train)
+    #model.train(train, ab_train, p_train)
 
     results = []
-
+    success = 0
+    total = 0
     for date, group in test.groupby("game_date", observed=True):
-        print(date, group.shape[0])
         tmp = group[["game_date", "batter", "hit"]].copy()
         tmp["proba"] = model.predict(group).values  # may contain same batter twice
         results.append(tmp)
+
+        total += (tmp.proba >= 0.78).sum()
+        success += (tmp.hit[tmp.proba >= 0.78] >= 1).sum()
+        print(date, group.shape[0], total, success / max(1, total))
+        print(tmp.proba.describe())
+        print()
+
         ab_group = ab_groups.get_group(date) if atbats is not None else None
         p_group = p_groups.get_group(date) if pitches is not None else None
         model.update(group, ab_group, p_group)

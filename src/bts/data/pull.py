@@ -11,6 +11,15 @@ from pybaseball import statcast
 from pybaseball.retrosheet import events
 import argparse
 from meteostat import Hourly, Point
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import time
+import glob
+import shutil
+from IPython import embed
 
 def download_statcast(start, end, base):
     for day in pd.date_range(start, end):
@@ -24,6 +33,7 @@ def download_statcast(start, end, base):
         data.to_csv('%s/%s/statcast.csv' % (base, daystr), index=False)
 
 def download_retrosheet(start, end, base):
+    # Note: if this fails, just download the retrosheet data manually
     loc = base + '/retrosheet/'
     for year in range(start.year, end.year+1):
         events(year, export_dir=loc)
@@ -117,6 +127,176 @@ def download_weather(start, end, base):
     data = pd.concat(weather)
     data.to_csv(base + '/weather.csv')
 
+def download_historical_vegas(start, end, base):
+    # Pretty buggy, usually fails after 25 steps, have to manually rerun each time it fails
+    key = show_date(start - datetime.timedelta(days=1))
+    url = 'https://www.bettingpros.com/mlb/odds/player-props/to-record-a-hit/?date=%s' % key
+    chrome_options = Options()
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--headless=new')  # disable to debug
+    driver = webdriver.Chrome(options=chrome_options)
+    driver.get(url)
+    driver.maximize_window()
+    driver.implicitly_wait(5)
+
+    results = []
+    NEXT_XPATH = '//button[@class="button button--styleless date-picker__arrow date-picker__arrow--right"]'
+    NAME_XPATH = '//div[@class="odds-player__info odds-player__info--small"]'
+    OPEN_XPATH = '//div[@class="odds-cell odds-cell--open odds-cell--event-completed"]'
+    CONSENSUS_XPATH = '//button[@class="odds-cell odds-cell--default odds-cell--event-completed"]'
+    for day in pd.date_range(start, end):
+        driver.find_element(By.XPATH, NEXT_XPATH).click()
+        
+        names = []
+        teams = []
+        open_odds = []
+        closed_odds = []
+        for element in driver.find_elements(By.XPATH, NAME_XPATH):
+            split = element.text.split('\n')
+            name = split[0]
+            team = split[1].split('-')[0][:-1]
+            names.append(name)
+            teams.append(team)
+            
+        for element in driver.find_elements(By.XPATH, OPEN_XPATH):
+            open_odds.append(element.text)
+        
+        for element in driver.find_elements(By.XPATH, CONSENSUS_XPATH):
+            closed_odds.append(element.text)
+       
+        try:
+            df = pd.DataFrame()
+            df['name'] = names
+            df['team'] = teams
+            df['date'] = day
+            df['open_odds'] = open_odds
+            df['closed_odds'] = closed_odds
+            daystr = show_date(day)
+            df.to_csv('%s/%s/vegas.csv' % (base, daystr), index=False)
+            print('Downloaded Vegas Data', day)
+        except Exception as e:
+            print('Skipping Vegas Data', day)
+            print(e)
+            continue
+
+    driver.close()
+
+
+def download_vegas(base):
+
+    daystr = show_date(pd.Timestamp.today())
+    timestr = pd.Timestamp.today().strftime('%Y-%m-%d_%H:%M')
+
+    url = 'https://www.bettingpros.com/mlb/odds/player-props/to-record-a-hit/?date=%s' % daystr
+    chrome_options = Options()
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--headless=new')
+    driver = webdriver.Chrome(options=chrome_options)
+    driver.get(url)
+    #driver.maximize_window()
+    driver.implicitly_wait(5)
+
+    results = []
+    NAME_XPATH = '//div[@class="odds-player__info odds-player__info--small"]'
+    OFFER_XPATH = '//div[@class="flex odds-offer__item"]'
+    HEADER_XPATH = '//div[@class="flex odds-offers-header__item"]/img'
+        
+    names = []
+    teams = []
+    offers = []
+    header = []
+
+    for element in driver.find_elements(By.XPATH, HEADER_XPATH):
+        column = element.get_attribute('alt').strip('Logo for ')
+        header.append(column)
+
+    header.append('Consensus')
+
+    # TODO: might it be faster to parse the entire block at once
+    # as we do for the offer cells?
+    for element in driver.find_elements(By.XPATH, NAME_XPATH):
+        split = element.text.split('\n')
+        name = split[0]
+        team = split[1].split('-')[0][:-1]
+        names.append(name)
+        teams.append(team)
+        
+    for element in driver.find_elements(By.XPATH, OFFER_XPATH):
+        offers.append(element.text)
+
+    driver.close()
+
+    offer_table = [x.split('\n') for x in offers]
+    assert len(offer_table) % len(header) == 0
+
+    df = pd.DataFrame()
+    df['name'] = names
+    df['team'] = teams
+    df['date'] = daystr
+    for index, column in enumerate(header):
+        df[column] = sum(offer_table[index::len(header)], [])
+
+    path = os.path.join(base, daystr, 'vegas_%s.csv' % timestr) 
+    df.to_csv(path, index=False)
+
+    convenient_loc = os.path.join(os.environ['BTSHOME'], 'vegas.csv')
+    shutil.copy(path, convenient_loc)
+
+
+
+def download_projections(base):
+    """Download projections from external model the current day."""
+    options = webdriver.ChromeOptions()
+    # Note: this option seems to work on my Desktop, but not on my laptop
+    # We must use headless mode to be compatible with crontab
+    options.add_argument('--headless=new')
+    driver = webdriver.Chrome(options=options)
+    username = os.environ['ROTOGRINDERS_USERNAME']
+    password = os.environ['ROTOGRINDERS_PASSWORD']
+    driver.get('https://rotogrinders.com/sign-in')
+
+    driver.maximize_window()
+    driver.implicitly_wait(5)
+    username_field = driver.find_element(By.NAME, 'username')
+    username_field.send_keys(username)
+    password_field = driver.find_element(By.NAME, 'password')
+    password_field.send_keys(password)
+    sign_in_xpath = "//input[@class='button highlight cta' and @type='submit']"
+    driver.find_element(By.XPATH, sign_in_xpath).click()
+
+    links = ['https://rotogrinders.com/grids/standard-projections-the-bat-x-hitters-3372512',
+            'https://rotogrinders.com/grids/standard-projections-the-bat-x-3372510']
+    xpaths = ["//a[@data-role='linkable' and @data-pointer='L2dyaWRzLzMzNzI1MTIuY3N2']",
+            "//a[@data-role='linkable' and @data-pointer='L2dyaWRzLzMzNzI1MTAuY3N2']"]
+    names = ["batter_projections", "pitcher_projections"]
+
+    daystr = show_date(pd.Timestamp.today())
+    timestr = pd.Timestamp.today().strftime('%Y-%m-%d_%H:%M')
+    if not os.path.isdir(base + '/' + daystr):
+        os.makedirs(base + '/' + daystr)
+
+    for link, xpath, name in zip(links, xpaths, names):
+
+        driver.get(link)
+        element = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, xpath)))
+        #driver.find_element(By.XPATH, DOWNLOAD_XPATH).click()
+        element.click()
+        time.sleep(5)
+
+        files = glob.glob(os.path.join(os.environ['HOME'], 'Downloads/*.csv'))
+        sorted_files = sorted(files, key=os.path.getmtime, reverse=True)
+
+        loc = os.path.join(base, daystr, name + '_' + timestr + '.csv')
+        shutil.move(sorted_files[0], loc)
+    
+        ironcond0r_loc = os.path.join(os.environ['BTSHOME'], name + '.csv')
+        shutil.copy(loc, ironcond0r_loc)
+
+    driver.close()
+
+
 def parse_date(date):
     return datetime.datetime.strptime(date, '%Y-%m-%d')
 
@@ -142,7 +322,7 @@ if __name__ == '__main__':
     description = 'download data and store in appropriate folder'
     formatter = argparse.ArgumentDefaultsHelpFormatter    
     parser = argparse.ArgumentParser(description=description, formatter_class=formatter)
-    parser.add_argument('--source', choices=['statcast', 'retrosheet', 'weather'], help='data source to download')
+    parser.add_argument('--source', choices=['statcast', 'retrosheet', 'weather', 'vegas', 'projections'], help='data source to download')
     parser.add_argument('--start', help='start date (yyyy-mm-dd)')
     parser.add_argument('--end', help='end date (yyyy-mm-dd)')
 
@@ -160,3 +340,9 @@ if __name__ == '__main__':
         download_retrosheet(start, end, base)
     if args.source == 'weather':
         download_weather(start, end, base)
+    if args.source == 'historical-vegas':
+        download_historical_vegas(start, end, base)
+    if args.source == 'projections':
+        download_projections(base)
+    if args.source == 'vegas':
+        download_vegas(base)

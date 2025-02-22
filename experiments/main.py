@@ -1,7 +1,8 @@
-from bts.evaluation.simulate import simulate
+from bts.evaluation.simulate import simulate, pretrain_model
 from bts.evaluation import metrics, visualize
 from bts.models.player_game.model import Baseline
 from bts.models.player_game.parametric import Logistic, Singlearity
+from bts.models.player_game.btsnet_v1 import BTSNet
 from bts.models.player_game.sequential import EloSystem
 import socket
 import matplotlib.pyplot as plt
@@ -37,20 +38,31 @@ def main(model, year):
     data = load_data()
     atbats = load_atbats()
     pitches = load_pitches()
-    data["hit"] = data.hit >= 1
+    data["num_hits"] = data.hit
+    data['hit'] = data.hit >= 1
 
+    train = data[data.game_year < year]
+    test = data[data.game_year >= year]
+
+    model.train(train)
     base = "./"
-    folder = base + str(model) + "_" + str(year)
+    folder = base + str(model)
     if not os.path.exists(folder):
         os.mkdir(folder)
 
-    results = simulate(model, data, atbats, pitches, test_year=year)
-    results["game_date"] = results.game_date.astype(str).str[:10]
-    results.to_csv(folder + "/results.csv", index=False)
+    results = []
+    for date, group in test.groupby('game_date', observed=True):
+        print(date)
+        tmp = group[['game_date', 'batter', 'hit']].copy()
+        tmp['proba'] = model.predict(group).values
+        tmp["game_date"] = tmp.game_date.astype(str).str[:10]
+        results.append(tmp)
+        model.update(group)
 
-    process_results(results, folder)
+        output = pd.concat(results)
+        output.to_csv(folder + "/results.csv", index=False)
 
-    return results
+    process_results(output, folder)
 
 
 def pick_distribution(results, top=2):
@@ -81,6 +93,7 @@ if __name__ == "__main__":
         "logistic": Logistic(),
         "elo": EloSystem(),
         "singlearity": Singlearity(0.001),
+        "btsnet": BTSNet(log=True),
     }
 
     description = "simulate BTS model"

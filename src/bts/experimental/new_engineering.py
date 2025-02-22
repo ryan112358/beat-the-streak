@@ -9,8 +9,15 @@ import functools
 import itertools
 import time
 from tqdm.auto import tqdm
+import multiprocessing.pool
+
+"""
+This is a parallellized version of engineering.py.  It's suposed to be faster, but doesn't appear to be.
+"""
 
 tqdm.pandas(desc="Progress")
+
+       
 
 SINGLEARITY_COLUMNS_ALL = [
     "woba",
@@ -35,7 +42,7 @@ SINGLEARITY_COLUMNS_ALL = [
     "estimated_ba_using_speedangle",
 ]
 SINGLEARITY_COLUMNS_SHORT = [
-    "pf_hit",
+    "pf_hit_1095",
     "single",
     "double",
     "triple",
@@ -89,8 +96,7 @@ def sliding_mean(df: pd.DataFrame, days: int = 365, thresh: int = 40):
         1. All columns of df other than game_date must be numeric (float, int, bool).
 
     :param df: the source data frame, must have game_date column.
-    :param days: The number of days in the sliding window.
-    :param thresh: The minimum number of observations in the time window.
+    :param days: The number of days in the sliding window.  :param thresh: The minimum number of observations in the time window.
 
     :returns: A new dataframe, with one entry per unique game_date, where 
         each entry is the rolling mean of previous `days` observations or NaN.
@@ -157,14 +163,13 @@ def ewm_by_partition(
     groups = df.groupby(groupby_keys, observed=True)[["game_date"] + columns]
     # Apply exponential moving avg to each group
     apply_fn = functools.partial(exponential_moving_avg, default=default, alpha=alpha)
-    result = (
-        groups.progress_apply(apply_fn)
-        .reset_index(level=-1, drop=True)
-        .set_index('game_date', append=True)
-        .reorder_levels(['game_date'] + groupby_keys)
-        .sort_index()
+    result = groups.apply(apply_fn).reset_index(groupby_keys).sort_index()
+    rename_fn = (
+        lambda s: "_".join(groupby_keys + [s, str(alpha)])
+        if not s in ["game_date"] + groupby_keys
+        else s
     )
-    return result
+    return result.rename(columns=rename_fn).reset_index(drop=True)
 
 
 def null_preserving_dummies(series):
@@ -257,12 +262,9 @@ def ewm_dummies_by_partition(
     default = derived_df.mean()
     derived_df["game_date"] = df["game_date"]
     derived_df[groupby_keys] = df[groupby_keys]
-
-    result = ewm_by_partition(
+    return ewm_by_partition(
         derived_df, groupby_keys, numeric_columns, alpha=alpha, default=default
     )
-    key = '_'.join(groupby_keys + dummy_cols) + '_exponential%d' % int(1/alpha)
-    return { key : result }
 
 
 def sliding_mean_by_partition(
@@ -283,22 +285,59 @@ def sliding_mean_by_partition(
     groups = df.groupby(groupby_keys, observed=True)[["game_date"] + columns]
     # Apply sliding window to the entire dataset
     apply_fn = lambda df: sliding_mean(df, days, thresh)
-    average = apply_fn(df[["game_date"] + columns]).bfill().set_index('game_date')
+    average = apply_fn(df[["game_date"] + columns]).bfill()  # fillna(method="bfill")
     # Apply sliding window mean to each group
     per_partition = (
-        groups.progress_apply(apply_fn)
-        .reset_index(level=-1, drop=True)
-        .set_index('game_date', append=True)
-        .reorder_levels(['game_date'] + groupby_keys)
-        .sort_index()
+        groups.apply(apply_fn)
+        .reset_index(level=groupby_keys)
+        .reset_index(drop=True)
     )
 
     if impute:  # Missing value imputation.  Update NaNs with imputed values.
         per_partition["imputed"] = ~per_partition[columns[0]].notnull()
-        per_partition.fillna(average, inplace=True)
+        imputed_vals = per_partition.drop(columns=columns).merge(
+            average, how="left", on="game_date"
+        )
+        assert imputed_vals.shape[0] == per_partition.shape[0]
+        per_partition.update(imputed_vals, overwrite=False)
 
-    key = '_'.join(groupby_keys) + '_sliding%d' % days
-    return { key : per_partition } 
+    # Rename columns so that they are unique.
+    rename_fn = (
+        lambda s: "_".join(groupby_keys + [s, str(days)])
+        if not s in ["game_date"] + groupby_keys
+        else s
+    )
+    return per_partition.rename(columns=rename_fn)
+
+
+class SlidingWindowFeature:
+    def __init__(self, source: pd.DataFrame, groupby_keys: list[str], aggregation_cols: list[str], days: int, thresh: int, impute: bool = True):
+        self.source = source
+        self.groupby_keys = groupby_keys
+        self.aggregation_cols = aggregation_cols
+        self.window = days
+        self.min_observations = thresh
+        self.impute = impute
+ 
+    def compute(self):
+        return sliding_mean_by_partition(
+            self.source, self.groupby_keys, self.aggregation_cols, days=self.window, thresh=self.min_observations, impute=self.impute)
+
+
+class DummyEWMFeature:
+    def __init__(self, df: pd.DataFrame, groupby_keys: list[str], dummy_cols: list[str], dummy_values: list, alpha: float):
+        self.source = df
+        self.groupby_keys = groupby_keys
+        self.dummy_cols = dummy_cols
+        self.dummy_values = dummy_values
+        self.decay = alpha
+ 
+    def compute(self):
+        return ewm_dummies_by_partition(self.source, self.groupby_keys, self.dummy_cols, self.dummy_values, self.decay)
+
+
+def materialize(feature):
+    return feature.compute()
 
 
 def park_factor_3year(atbats):
@@ -306,75 +345,65 @@ def park_factor_3year(atbats):
     events = ["single", "double", "triple", "home_run", "hit", "woba"]
     home_hits = sliding_mean_by_partition(atbats, ["home_team"], events, days, 40)
     away_hits = sliding_mean_by_partition(atbats, ["away_team"], events, days, 40)
-    # this function returns dictionaries now, next(iter( )) grabs the single element
-    home_hits, away_hits = next(iter(home_hits.values())), next(iter(away_hits.values()))
-    home_hits = (
-        home_hits
-        .reset_index()
-        .rename(columns={"home_team": "ballpark"})
+    home_hits = home_hits.rename(columns={"home_team": "ballpark"}).sort_values(
+        "game_date"
     )
-
-    away_hits = (
-        away_hits
-        .reset_index()
-        .rename(columns={"away_team": "ballpark"})
+    away_hits = away_hits.rename(columns={"away_team": "ballpark"}).sort_values(
+        "game_date"
     )
     tmp = pd.merge_asof(home_hits, away_hits, on="game_date", by="ballpark")
     for e in events:
-        cironcond0r_batter_game_year_featuresol1 = "%s_x" % e
-        col1 = "%s_x" % e
-        col2 = "%s_y" % e
-        tmp['pf_'+e] = tmp.pop(col1) / tmp.pop(col2)
-    tmp['pf_imputed'] = tmp['imputed_x'] | tmp['imputed_y']
-    columns = ['pf_'+e for e in events] + ['pf_imputed']
-    tmp = tmp.set_index(['game_date', 'ballpark'])[columns]
-    return { 'ballpark_sliding1095' : tmp }
+        col1 = "home_team_%s_%d" % (e, days)
+        col2 = "away_team_%s_%d" % (e, days)
+        col = "pf_%s_%d" % (e, days)
+        tmp[col] = tmp.pop(col1) / tmp.pop(col2)
+    return tmp
 
 
 def batter_3year(atbats):
-    return sliding_mean_by_partition(
+    return SlidingWindowFeature(
         atbats, ["batter"], SINGLEARITY_COLUMNS_ALL, 365 * 3, 40
     )
 
 
 def pitcher_3year(atbats):
-    return sliding_mean_by_partition(
+    return SlidingWindowFeature(
         atbats, ["pitcher"], SINGLEARITY_COLUMNS_ALL, 365 * 3, 40
     )
 
 
 def batter_1year(atbats):
-    return sliding_mean_by_partition(
+    return SlidingWindowFeature(
         atbats, ["batter"], SINGLEARITY_COLUMNS_ALL, 365, 40
     )
 
 
 def pitcher_1year(atbats):
-    return sliding_mean_by_partition(
+    return SlidingWindowFeature(
         atbats, ["pitcher"], SINGLEARITY_COLUMNS_ALL, 365, 40
     )
 
 
 def batter_recent(atbats):
-    return sliding_mean_by_partition(
+    return SlidingWindowFeature(
         atbats, ["batter"], SINGLEARITY_COLUMNS_SHORT, 21, 20
     )
 
 
 def pitcher_recent(atbats):
-    return sliding_mean_by_partition(
+    return SlidingWindowFeature(
         atbats, ["pitcher"], SINGLEARITY_COLUMNS_SHORT, 21, 20
     )
 
 
 def batter_vs_pitcher_3year(atbats):
-    return sliding_mean_by_partition(
+    return SlidingWindowFeature(
         atbats, ["batter", "pitcher"], SINGLEARITY_COLUMNS_SHORT, 365 * 3, 10
     )
 
 
 def pitcher_type(pitches, alpha=0.01):
-    return ewm_dummies_by_partition(
+    return DummyEWMFeature(
         df=pitches,
         groupby_keys=["pitcher"],
         dummy_cols=["pitch_type"],
@@ -384,7 +413,7 @@ def pitcher_type(pitches, alpha=0.01):
 
 
 def batter_type(pitches, alpha=0.01):
-    return ewm_dummies_by_partition(
+    return DummyEWMFeature(
         df=pitches,
         groupby_keys=["batter"],
         dummy_cols=["pitch_type"],
@@ -394,7 +423,7 @@ def batter_type(pitches, alpha=0.01):
 
 
 def pitcher_description(pitches, alpha=0.01):
-    return ewm_dummies_by_partition(
+    return DummyEWMFeature(
         df=pitches,
         groupby_keys=["pitcher"],
         dummy_cols=["description"],
@@ -404,7 +433,7 @@ def pitcher_description(pitches, alpha=0.01):
 
 
 def pitcher_zone(pitches, alpha=0.01):
-    return ewm_dummies_by_partition(
+    return DummyEWMFeature(
         df=pitches,
         groupby_keys=["pitcher"],
         dummy_cols=["zone"],
@@ -414,7 +443,7 @@ def pitcher_zone(pitches, alpha=0.01):
 
 
 def pitcher_zone_outcome(pitches, alpha=0.01):
-    return ewm_dummies_by_partition(
+    return DummyEWMFeature(
         df=pitches,
         groupby_keys=["pitcher"],
         dummy_cols=["description", "zone"],
@@ -424,7 +453,7 @@ def pitcher_zone_outcome(pitches, alpha=0.01):
 
 
 def batter_zone(pitches, alpha=0.01):
-    return ewm_dummies_by_partition(
+    return DummyEWMFeature(
         df=pitches,
         groupby_keys=["batter"],
         dummy_cols=["zone"],
@@ -434,7 +463,7 @@ def batter_zone(pitches, alpha=0.01):
 
 
 def batter_outcome(pitches, alpha=0.01):
-    return ewm_dummies_by_partition(
+    return DummyEWMFeature(
         df=pitches,
         groupby_keys=["batter"],
         dummy_cols=["description"],
@@ -444,7 +473,7 @@ def batter_outcome(pitches, alpha=0.01):
 
 
 def pitcher_outcome(pitches, alpha=0.01):
-    return ewm_dummies_by_partition(
+    return DummyEWMFeature(
         df=pitches,
         groupby_keys=["pitcher"],
         dummy_cols=["description"],
@@ -454,7 +483,7 @@ def pitcher_outcome(pitches, alpha=0.01):
 
 
 def batter_zone_outcome(pitches, alpha=0.01):
-    return ewm_dummies_by_partition(
+    return DummyEWMFeature(
         df=pitches,
         groupby_keys=["batter"],
         dummy_cols=["description", "zone"],
@@ -464,7 +493,7 @@ def batter_zone_outcome(pitches, alpha=0.01):
 
 
 def pitcher_type_outcome(pitches, alpha=0.01):
-    return ewm_dummies_by_partition(
+    return DummyEWMFeature(
         df=pitches,
         groupby_keys=["pitcher"],
         dummy_cols=["description", "pitch_type"],
@@ -474,27 +503,27 @@ def pitcher_type_outcome(pitches, alpha=0.01):
 
 
 def all_pitcher_ewm_features(pitches, alpha):
-    return (
-        pitcher_type_outcome(pitches, alpha) |
-        pitcher_type(pitches, alpha) |
-        pitcher_zone(pitches, alpha) |
-        pitcher_zone_outcome(pitches, alpha) |
-        pitcher_outcome(pitches, alpha)
-    )
+    return [
+        pitcher_type_outcome(pitches, alpha),
+        pitcher_type(pitches, alpha),
+        pitcher_zone(pitches, alpha),
+        pitcher_zone_outcome(pitches, alpha),
+        pitcher_outcome(pitches, alpha),
+    ]
 
 
 def all_batter_ewm_features(pitches, alpha):
-    return (
-        batter_type_outcome(pitches, alpha) |
-        batter_type(pitches, alpha) |
-        batter_zone(pitches, alpha) |
-        batter_zone_outcome(pitches, alpha) |
-        batter_outcome(pitches, alpha)
-    )
+    return [
+        batter_type_outcome(pitches, alpha),
+        batter_type(pitches, alpha),
+        batter_zone(pitches, alpha),
+        batter_zone_outcome(pitches, alpha),
+        batter_outcome(pitches, alpha),
+    ]
 
 
 def batter_type_outcome(pitches, alpha=0.01):
-    return ewm_dummies_by_partition(
+    return DummyEWMFeature(
         df=pitches,
         groupby_keys=["batter"],
         dummy_cols=["description", "pitch_type"],
@@ -503,30 +532,39 @@ def batter_type_outcome(pitches, alpha=0.01):
     )
 
 
+def merge_features(features, key):
+    df = features[0].sort_values("game_date")
+    for feature in features[1:]:
+        df = pd.merge(df, feature, on=key + ['game_date'], how="left")
+        # feature = feature.sort_values('game_date')
+        # df = pd.merge_asof(df, feature, on='game_date', by=key[:-1])
+    return df
+
+
 def all_batter_features(atbats, pitches):
-    return (
-        batter_3year(atbats) |
-        batter_1year(atbats) |
-        batter_recent(atbats) |
-        all_batter_ewm_features(pitches, 1 / 256) | 
-        all_batter_ewm_features(pitches, 1 / 1024) |
-        all_batter_ewm_features(pitches, 1 / 8192)
+    features = (
+        [batter_3year(atbats), batter_1year(atbats), batter_recent(atbats)]
+        + all_batter_ewm_features(pitches, 1 / 256)
+        + all_batter_ewm_features(pitches, 1 / 1024)
+        + all_batter_ewm_features(pitches, 1 / 8192)
+        + [batter_7day_woba(atbats)]
     )
+    return features
 
 
 def all_pitcher_features(atbats, pitches):
-    return (
-        pitcher_3year(atbats) |
-        pitcher_1year(atbats) |
-        pitcher_recent(atbats) |
-        all_pitcher_ewm_features(pitches, 1 / 256) |
-        all_pitcher_ewm_features(pitches, 1 / 1024) |
-        all_pitcher_ewm_features(pitches, 1 / 8192)
+    features = (
+        [pitcher_3year(atbats), pitcher_1year(atbats), pitcher_recent(atbats)]
+        + all_pitcher_ewm_features(pitches, 1 / 256)
+        + all_pitcher_ewm_features(pitches, 1 / 1024)
+        + all_pitcher_ewm_features(pitches, 1 / 8192)
     )
+    return features
 
 
 def all_park_features(atbats):
-    return park_factor_3year(atbats)
+    features = [park_factor_3year(atbats)]
+    return features[0]
 
 
 def all_batter_team_features(atbats):
@@ -538,11 +576,13 @@ def all_batter_team_features(atbats):
         .reset_index()
         .sort_values("game_date")
     )
-    return sliding_mean_by_partition(pa_per_game, ["batter_team"], ["PA"], 60, 10)
+    pa = SlidingWindowFeature(pa_per_game, ["batter_team"], ["PA"], 60, 10)
+    features = [pa]
+    return features
 
 
-def ironcond0r_features(atbats, data):
-    L7WOBA = sliding_mean_by_partition(
+def batter_7day_woba(atbats):
+    return SlidingWindowFeature(
         atbats,
         ["batter"],
         ["estimated_woba_using_speedangle"],
@@ -551,16 +591,20 @@ def ironcond0r_features(atbats, data):
         impute=False,
     )
 
-    FSxBA = sliding_mean_by_partition(
+
+def batter_pthrows_game_year_features(atbats):
+    return [SlidingWindowFeature(
         atbats,
         ["batter", "game_year", "p_throws"],
         ["estimated_ba_using_speedangle"],
         days=365,
         thresh=20,
         impute=False,
-    )
+    )]
 
-    L28GWAH = sliding_mean_by_partition(
+
+def batter_game_year_features(data):
+    L28GWAH = SlidingWindowFeature(
         data,
         ['batter', 'game_year'],
         ['hit_at_least_one', 'ehit_at_least_one'],
@@ -569,7 +613,7 @@ def ironcond0r_features(atbats, data):
         impute=False
     )
 
-    FSGWAH = sliding_mean_by_partition(
+    FSGWAH = SlidingWindowFeature(
         data,
         ['batter', 'game_year'],
         ['hit_at_least_one', 'ehit_at_least_one'],
@@ -577,7 +621,8 @@ def ironcond0r_features(atbats, data):
         thresh=10,
         impute=False
     )
-    return L7WOBA | FSxBA | L28GWAH | FSGWAH
+
+    return [L28GWAH, FSGWAH]
 
 if __name__ == "__main__":
     t0 = time.time()
@@ -613,30 +658,35 @@ if __name__ == "__main__":
     atbats["woba"] = sum(weights[e] * atbats[e] for e in weights)
     print("Preprocessed Data", time.time() - t0)
 
-
     park_features = all_park_features(atbats)
-    atbats = atbats.merge(park_features['ballpark_sliding1095'], how="left", left_on=["game_date", "ballpark"], right_index=True)
+    atbats = atbats.merge(park_features, how="left", on=["ballpark", "game_date"])
     print("Computed and Merged Park Features", time.time() - t0)
 
-    batter_team_features = all_batter_team_features(atbats)
-    print("Computed Team Features", time.time() - t0)
 
     batter_features = all_batter_features(atbats, pitches)
-    print("Computed Batter Features", time.time() - t0)
 
     pitcher_features = all_pitcher_features(atbats, pitches)
-    print("Computed Pitcher Features", time.time() - t0)
 
-    ironcond0r = dict()  #ironcond0r_features(atbats, data)
+    batter_team_features = all_batter_team_features(atbats)
 
-    all_features = (
-        park_features | batter_features | pitcher_features | batter_team_features | ironcond0r
-    )
-    
-    # embed()
+    ironcond0r_batter_game_year_features = batter_game_year_features(data)
+    ironcond0r_batter_pthrows_game_year_features = batter_pthrows_game_year_features(atbats)
+
+    print('Beginning multiprocessing work')
+    work = batter_features + pitcher_features + batter_team_features
+    work += ironcond0r_batter_game_year_features
+    work += ironcond0r_batter_pthrows_game_year_features
+    print(work)
+
+    with multiprocessing.pool.ThreadPool(20) as p:
+        results = p.map(materialize, work)
+
 
     ROOT = os.environ["BTSDATA"]
-    for key, df in all_features.items():
-        df.to_parquet(
-            f"{ROOT}/engineered/%s.parquet.gzip" % key, compression="gzip"
-        )
+    for groupby_keys in [['batter'], ['pitcher'], ['batter_team']]:
+        features = [F for info, F in zip(work, results) if info.groupby_keys == groupby_keys]
+        joined = merge_features(features, groupby_keys)
+        key = "_".join(groupbg_keys)
+        path = f"{ROOT}/%s_features.parquet.gzip" % key
+        joined.to_parquet(path, compression='gzip')
+

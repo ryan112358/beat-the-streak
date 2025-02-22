@@ -8,6 +8,7 @@ from pybaseball import player_search_list
 import os
 import pickle
 import time
+import difflib
 from IPython import embed
 
 ROOT = os.environ["BTSDATA"]
@@ -108,8 +109,13 @@ def process_all_data(pattern="*"):
     # Note: it is very important that pitches data and retrosheet data is
     # consistent before merged w.r.t. mlbid/player name.
     player_lookup = player_lookup_from_statcast(pitches)
+    player_lookup.to_frame().to_parquet(path=f"{ROOT}/player_lookup.parquet.gzip", compression="gzip")
     pitches["batter"] = pitches.batter.map(player_lookup).astype("category")
     pitches["pitcher"] = pitches.pitcher.map(player_lookup).astype("category")
+
+    batx = load_batx()
+    batx["batter"] = batx["MLBAM_ID"].map(player_lookup)
+    print("Loaded and cleand batx data", time.time() - t0)
 
     # First make the retrosheet data joinable with the statcast data
     # We will not perform the join here, since retrosheet is not available
@@ -123,6 +129,8 @@ def process_all_data(pattern="*"):
     retrosheet_gameids["home_starter"] = retrosheet_gameids.home_starter.map(
         player_lookup
     )
+
+    joinable_batx = make_batx_joinable(batx, pitches)
 
     print("Computed retrosheet game_ids", time.time() - t0)  # 141s
 
@@ -153,7 +161,7 @@ def process_all_data(pattern="*"):
 
     print("Added lineup information to batter/games", time.time() - t0)  # 766s
 
-    return pitches, atbats, batter_games, joinable_retrosheet
+    return pitches, atbats, batter_games, joinable_retrosheet, joinable_batx, player_lookup
 
 
 def load_statcast(pattern="*"):
@@ -252,10 +260,12 @@ def load_statcast(pattern="*"):
     }
 
     # We want to read in categories as strings (in particular: zone)
-    dtype_read = {k: str if v in ["datetime64[ns]", "category"] else v for k, v in cols.items()}
+    dtype_read = {
+        k: str if v in ["datetime64[ns]", "category"] else v for k, v in cols.items()
+    }
     # These should also ideally be read in as string, but retrosheet loads them as floats
-    dtype_read['batter'] = float
-    dtype_read['pitcher'] = float
+    dtype_read["batter"] = float
+    dtype_read["pitcher"] = float
 
     files = glob.glob(f"{ROOT}/{pattern}/")
     dfs = []
@@ -296,6 +306,15 @@ def load_statcast(pattern="*"):
     return df.sort_values(
         by=["game_date", "game_pk", "at_bat_number", "pitch_number"]
     ).reset_index(drop=True)
+
+
+def load_batx():
+    # Note: this data is incomplete.  It is missing data in several places,
+    # including, but not limited to:
+    # All of 2019 (except one date)
+    # April 2021 and 2022
+    # TODO: merge with 6-week 2023 data
+    return pd.read_csv(f"{ROOT}/hit_projections.csv")
 
 
 def load_retrosheet():
@@ -458,6 +477,37 @@ def make_retrosheet_joinable(retrosheet_data, statcast_gameids, retrosheet_gamei
     return retrosheet_data[cols]
 
 
+def make_batx_joinable(bat, statcast):
+    # This converts the 2020 - 2022 batx data into a dataframe with 4 columns:
+    # batter, batter_team, game_date, H_proj
+    bat["game_date"] = bat.pop("DATE").astype("datetime64[ns]")
+
+    # Convert batter_name.  Note: No longer needed
+    """
+    bat_names = set(bat['NAME'])
+    statcast_names = set(statcast[statcast.game_year >= 2019].batter)
+    mapping = {}
+    for item in bat_names:
+        match = difflib.get_close_matches(item, statcast_names)[0]
+        mapping[item] = match
+
+    mapping['Dee Gordon'] = 'Dee Strange-Gordon'
+    bat['batter'] = bat.pop('NAME').map(mapping)
+    """
+
+    # Convert batter_team
+    bat_teams = set(bat["TEAM"])
+    statcast_teams = set(statcast[statcast.game_year >= 2019].batter_team)
+    mapping = {}
+    for item in bat_teams:
+        match = difflib.get_close_matches(item, statcast_teams)[0]
+        mapping[item] = match
+
+    bat["batter_team"] = bat.pop("TEAM").map(mapping)
+
+    return bat[["game_date", "batter", "batter_team", "H_proj"]]
+
+
 def load_weather():
     # Not currently used, currently getting weather data from retrosheet
     # Revisit in the future, since this allows you to get recent weather
@@ -527,12 +577,34 @@ def atbats_from_pitches(pitches):
         "of_fielding_alignment",
         "home",
         "estimated_ba_using_speedangle",
+        "estimated_woba_using_speedangle",
     ]
     atbats = pitches[pitches.events.isin(events)][cols]
     atbats["hit"] = atbats.events.isin(["single", "double", "triple", "home_run"])
     atbats["ehit"] = atbats.estimated_ba_using_speedangle.fillna(
         atbats.hit.astype(float)
     )
+
+    weights = dict(
+        walk=0.69,
+        hit_by_pitch=0.719,
+        single=0.87,
+        double=1.217,
+        triple=1.529,
+        home_run=1.94,
+        sac_fly=0,
+    )
+    atbats.estimated_woba_using_speedangle.fillna(
+        atbats.events.map(weights), inplace=True
+    )
+
+    weights = dict(
+        single=1, double=1, triple=1, home_run=1, strikeout=0, strikeout_double_play=0
+    )
+    atbats.estimated_ba_using_speedangle.fillna(
+        atbats.events.map(weights), inplace=True
+    )
+
     return atbats.sort_values(["game_date", "game_pk"])
 
 
@@ -558,9 +630,11 @@ def games_from_atbats(atbats):
         atbats.groupby(["game_pk", "batter_team", "batter"], observed=True)[
             ["hit", "ehit"]
         ]
-        .sum()
-        .reset_index()
+        .agg(["sum", ("at_least_one", lambda p: 1 - (1 - p).prod())])
     )
+    # consider changing the name of "hit" throughout codebase
+    hits.columns = hits.columns.map("_".join)
+    hits = hits.rename(columns={"hit_sum": "hit", "ehit_sum": "ehit"}).reset_index()
     return hits.merge(games, on=["game_pk", "batter_team"]).sort_values(
         ["game_date", "game_pk"]
     )
@@ -590,17 +664,21 @@ def lineups_from_statcast(pitches):
 
 
 def player_lookup_from_statcast(pitches):
+    # TODO: consider using https://www.smartfantasybaseball.com/tools/, since
+    # playerid_reverse_lookup does not include suffixes like "Jr", etc.
     players = list(set(pitches.batter).union(set(pitches.pitcher)))
     A = playerid_reverse_lookup(players).set_index("key_mlbam")
     return (A["name_first"] + " " + A["name_last"]).str.title()
 
 
 if __name__ == "__main__":
-    pitches, atbats, batter_games, retrosheet = process_all_data()
+    pitches, atbats, batter_games, retrosheet, batx, player_lookup = process_all_data()
 
     pitches.to_parquet(path=f"{ROOT}/pitches.parquet.gzip", compression="gzip")
     atbats.to_parquet(path=f"{ROOT}/atbats.parquet.gzip", compression="gzip")
     batter_games.to_parquet(path=f"{ROOT}/data.parquet.gzip", compression="gzip")
     retrosheet.to_parquet(path=f"{ROOT}/retrosheet.parquet.gzip", compression="gzip")
+    batx.to_parquet(path=f"{ROOT}/batx.parquet.gzip", compression="gzip")
+    player_lookup.to_frame().to_parquet(path=f"{ROOT}/player_lookup.parquet.gzip", compression="gzip")
 
     # embed()
