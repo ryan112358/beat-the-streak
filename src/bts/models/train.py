@@ -10,7 +10,7 @@ import optax
 import IPython
 
 # jax.config.update("jax_debug_nans", True)
-# jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_enable_x64", True)
 
 
 def default_params():
@@ -28,6 +28,7 @@ def default_params():
     params["batch_size"] = 8
     params["mixture_components"] = 8
     params["sequence_length"] = 400
+    params["learning_rate"] = 1e-4
 
     return params
 
@@ -46,6 +47,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mixture_components", type=int, help="number of mixture components"
     )
+    parser.add_argument("--learning_rate", type=float, help="learning rate")
 
     parser.set_defaults(**default_params())
     args = parser.parse_args()
@@ -88,11 +90,15 @@ if __name__ == "__main__":
         "iso_value",
     ]
 
+    """
+    context_categorical = []
+    context_numerical = []
     pitcher_categorical = ["pitch_type"]
-    pitcher_numerical = ["plate_x", "plate_z"]
+    pitcher_numerical = [] #"plate_x", "plate_z"]
 
-    batter_categorical = ["description"]
-    batter_numerical = ["estimated_ba_using_speedangle"]
+    batter_categorical = [] #"description"]
+    batter_numerical = [] #"estimated_ba_using_speedangle"]
+    """
 
     data = sequences.PitchSequences.load(
         context_categorical,
@@ -117,20 +123,21 @@ if __name__ == "__main__":
     total_params = sum(x.size for x in jax.tree.leaves(params))
     print("Model Size: %.2f M" % (total_params / 10**6))
 
-    optimizer = nnx.Optimizer(model, optax.adamw(1e-4, 0.9))
+    optimizer = nnx.Optimizer(model, optax.adamw(args.learning_rate, 0.9))
     pitch_cat_loss = pitch_num_loss = bat_cat_loss = bat_num_loss = 0
-    type_loss = real_loss = 0.0
+
+    columns=pitcher_categorical+pitcher_numerical+batter_categorical+batter_numerical
+    results = pd.DataFrame(columns=columns, index=range(args.iterations))
+
+    print('\t'.join(columns))
+
     for t in range(args.iterations):
-        aux = transformer.train_step(model, optimizer, data.sample(args.batch_size))
-        pitch_cat_loss += sum(aux[0][0])
-        pitch_num_loss += aux[0][1]
-        bat_cat_loss += sum(aux[1][0])
-        bat_num_loss += aux[1][1]
+        batch = data.sample(args.batch_size)
+        aux = transformer.train_step(model, optimizer, batch)
+        row = list(aux[0][0]) + list(aux[0][1]) + list(aux[1][0]) + list(aux[1][1])
+        results.loc[t] = [float(x) for x in row]
         if t % 100 == 99:
-            print(
-                pitch_cat_loss / 100,
-                pitch_num_loss / 100,
-                bat_cat_loss / 100,
-                bat_num_loss / 100,
-            )
-            pitch_cat_loss = pitch_num_loss = bat_cat_loss = bat_num_loss = 0.0
+            metrics = results.loc[t-99:t].mean()
+            print('\t'.join(['%.2f' % s for s in metrics.values]))
+
+    results.to_csv('results.csv')

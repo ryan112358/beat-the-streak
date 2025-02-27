@@ -55,6 +55,10 @@ class PitchInfoBlock:
         numerical_features = self.numerical.shape[-1]
         return vocab_sizes, numerical_features
 
+    @property
+    def tokens(self):
+        return self.categorical_missing_mask.sum() + self.numerical_missing_mask.sum()
+
     @classmethod
     def from_groups(
         cls,
@@ -100,12 +104,19 @@ class PitchSequences:
         raise ValueError(f'Unrecognized {key=}')
 
     @property
+    def tokens(self):
+        return self.pitcher_outcomes.tokens + self.batter_outcomes.tokens
+
+    @property
     def num_sequences(self) -> int:
         return self.pitch_context.categorical.shape[0]
 
     @property
     def sequence_length(self) -> int:
         return self.pitch_context.categorical.shape[1]
+
+    def roll(self, k: int) -> 'PitchSequences':
+        return jax.tree.map(lambda x: jnp.roll(x, k, axis=1), self)
 
     @classmethod
     def load(

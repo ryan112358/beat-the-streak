@@ -97,7 +97,10 @@ class TransformerBlock(nnx.Module):
             An array of shape (B, S, H) representing the output of the transformer block.
         """
 
-        x = x + self.attention(x, decode=False, mask=mask, deterministic=deterministic)
+        # Attention requires ~ B * S^2 * H space, by using remat we do not have to pay an extra factor of L.
+        attn = jax.remat(lambda x, mask: self.attention(x, decode=False, mask=mask, deterministic=deterministic))
+
+        x = x + attn(x, mask)
         x = self.layernorm(x)
         x = self.dropout(x, deterministic=deterministic)
 
@@ -199,6 +202,10 @@ class OutputHead(nnx.Module):
         rngs: nnx.Rngs,
         dtype: jnp.dtype = jnp.float32,
     ):
+        self.mixture_components = mixture_components
+        self.num_numerical_features = num_numerical_features
+
+        dummy_layer = lambda x: jnp.zeros(x.shape[:-1] + (0,))
 
         self.categorical_final = [
             nnx.Linear(in_features=hidden_dim, out_features=v, dtype=dtype, rngs=rngs)
@@ -210,28 +217,39 @@ class OutputHead(nnx.Module):
             out_features=mixture_components,
             dtype=dtype,
             rngs=rngs,
-        )
+        ) # if num_numerical_features > 0 else dummy_layer
+
         self.numeric_final_means = nnx.Linear(
             in_features=hidden_dim,
             out_features=mixture_components * num_numerical_features,
             dtype=dtype,
             rngs=rngs,
-        )
+        ) if num_numerical_features > 0 else dummy_layer
+
         self.numeric_final_variances = nnx.Linear(
             in_features=hidden_dim,
             out_features=mixture_components * num_numerical_features,
             dtype=dtype,
             rngs=rngs,
-        )
+        ) if num_numerical_features > 0 else dummy_layer
 
     def __call__(self, x: jax.Array) -> losses.OutputDistribution:
+
+        F = self.num_numerical_features
+        M = self.mixture_components
+
+        mixture_weights = nnx.softmax(self.numeric_final_weights(x))
+        mixture_means = self.numeric_final_means(x).reshape(*x.shape[:2], M, F)
+        mixture_variances = nnx.relu(self.numeric_final_variances(x)) + 0.001
+        mixture_variances = mixture_variances.reshape(*x.shape[:2], M, F)
+        mixture_cov = jax.vmap(jax.vmap(jax.vmap(jnp.diag)))(mixture_variances)
 
         return losses.OutputDistribution(
             logits=[layer(x) for layer in self.categorical_final],
             # TODO: can the mixture components depend on the observed pitch types?
-            mixture_weights=nnx.softmax(self.numeric_final_weights(x)),
-            mixture_means=self.numeric_final_means(x),
-            mixture_variances=nnx.relu(self.numeric_final_variances(x)) + 0.001,
+            mixture_weights=mixture_weights,
+            mixture_means=mixture_means,
+            mixture_cov=mixture_cov,
         )
 
 
@@ -324,22 +342,29 @@ class Transformer(nnx.Module):
         """
         if mask is None:
             B, S = batch.num_sequences, batch.sequence_length
-            mask = nnx.make_causal_mask(jax.ShapeDtypeStruct((B, 3 * S), jnp.float32))
+            mask = nnx.make_causal_mask(jax.ShapeDtypeStruct((B, S), jnp.float32))
 
         xs = self.embedding(batch)
+        x = xs["pitch_context"] + xs["pitcher_outcomes"] + xs["batter_outcomes"]
 
         # the pitch outcome can depend on the context of the current pitch
         # as well as the context and outcome of all previous pitches.
-        x = interleave_sequences(
-            xs["pitch_context"], xs["pitcher_outcomes"], xs["batter_outcomes"]
-        )
+        #x = interleave_sequences(
+        #    xs["pitch_context"], xs["pitcher_outcomes"], xs["batter_outcomes"]
+        #)
 
         for layer in self.blocks:
             x = layer(x, mask, deterministic)
 
-        pitcher_outcome = self.pitcher_head(x[:, ::3])
-        batter_outcome = self.batter_head(x[:, 1::3])
-        return pitcher_outcome, batter_outcome
+        # [1,2,3,4,5] --> [2,3,4,5,1]
+        shift = lambda tree: jax.tree.map(lambda x: jnp.roll(x, -1, axis=1), tree)
+
+        x = x + shift(xs["pitch_context"])
+        pitcher_outcome_prediction = self.pitcher_head(x)
+
+        x = x + shift(xs["pitcher_outcomes"])
+        batter_outcome_prediction = self.batter_head(x)
+        return pitcher_outcome_prediction, batter_outcome_prediction
 
 
 @nnx.jit
@@ -366,7 +391,8 @@ def train_step(
         pitcher_distribution, batter_distribution = model(batch)
         loss1, aux1 = pitcher_distribution.loss_fn(batch.pitcher_outcomes)
         loss2, aux2 = batter_distribution.loss_fn(batch.batter_outcomes)
-        return loss1 + loss2, (aux1, aux2)
+        tokens = batch.tokens
+        return (loss1 + loss2) / tokens, (aux1, aux2)
 
     (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model, batch)
     optimizer.update(grads)
