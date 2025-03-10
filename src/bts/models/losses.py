@@ -39,6 +39,7 @@ class OutputDistribution:
         self,
         batch: sequences.PitchInfoBlock,
     ) -> tuple[float, Any]:
+        batch = batch.roll(-1)
         masks = jnp.moveaxis(batch.categorical_missing_mask, -1, 0)
         outcomes = jnp.moveaxis(batch.categorical, -1, 0)
         categorical_out = [
@@ -100,7 +101,7 @@ def clean(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Apply missing_mask to data points and Gaussian mixture parameters.
 
-    This ensures that hte contribution from entries of x that are missing
+    This ensures that the contribution from entries of x that are missing
     are zeroed out in subsequent loss calculations.
     """
     x = x * missing_mask
@@ -115,18 +116,18 @@ def clean(
 
 
 def gmm_log_likelihood(
-    x: jax.Array, # (F,)
+    x: jax.Array, # (F,) or (B,F)
     mu: jax.Array, # (M, F)
     cov: jax.Array, # (M, F, F)
     weights: jax.Array, # (M,)
-) -> float:
+) -> jax.Array: # () or (B,)
     """Compute the log likelihood of data given Gaussian mixture parameters."""
 
     def component_logpdfs(mu, cov):
         return jax.scipy.stats.multivariate_normal.logpdf(x, mu, cov)
 
-    logpdfs = jax.vmap(component_logpdfs)(mu, cov)
-    return jax.scipy.special.logsumexp(logpdfs, b=weights)
+    logpdfs = jax.vmap(component_logpdfs, out_axes=-1)(mu, cov)
+    return jax.scipy.special.logsumexp(logpdfs, b=weights, axis=-1)
 
 def gmm_dim_i_conditional_log_likelihood(
     x: jax.Array, # (F,)
@@ -217,8 +218,7 @@ def batched_gmm_log_loss_with_metrics(
 
     out, metrics = bar(data, mu, cov, weights, missing_mask)
 
-    denom = missing_mask.sum()
     denom_per_dim = missing_mask.sum(axis=(0,1))
-    loss = -out #-jnp.where(denom != 0, out / denom, 0)
+    loss = -out
     metrics = -jnp.where(denom_per_dim != 0, metrics / denom_per_dim, 0)
     return loss, metrics

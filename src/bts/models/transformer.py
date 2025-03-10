@@ -14,6 +14,41 @@ import jax.numpy as jnp
 from flax import nnx
 import optax
 from bts.models import losses, sequences
+import functools
+
+
+def causal_flash_attention_fn(query, key, value, **kwargs):
+    return jax.nn.dot_product_attention(
+        query,
+        key,
+        value,
+        implementation="xla",
+        is_causal=True,
+        # local_window_size=1024
+    )
+
+
+def pad_and_fill(
+    small_array: jax.Array, large_array: jax.Array, init_weight: float = 0.0
+) -> jax.Array:
+    small_shape = small_array.shape
+    large_shape = large_array.shape
+    if large_array.dtype == jnp.float32:
+        large_array = large_array * init_weight
+
+    if len(small_shape) != len(large_shape):
+        raise ValueError("Arrays must have the same number of dimensions.")
+
+    for i in range(len(small_shape)):
+        if small_shape[i] > large_shape[i]:
+            raise ValueError(
+                f"Dimension {i} of small_array must be <= dimension {i} of large_array."
+            )
+
+    slices = tuple(slice(0, dim) for dim in small_shape)
+
+    result = large_array.at[slices].set(small_array)
+    return result
 
 
 def sinusoidal_position_embeddings(S: int, H: int) -> jax.Array:
@@ -33,6 +68,32 @@ def interleave_sequences(*arrays: jax.Array) -> jax.Array:
     reshaped_arrays = [arr.reshape(B, S, 1, H) for arr in arrays]
     interleaved = jnp.concatenate(reshaped_arrays, axis=2)
     return interleaved.reshape(B, n * S, H)
+
+
+class FFNBlock(nnx.Module):
+    def __init__(
+        self,
+        hidden_dim: int,
+        rngs: nnx.Rngs,
+        dropout_rate: float = 0.0,
+        dtype: jnp.dtype = jnp.float32,
+    ):
+
+        self.linear1 = nnx.Linear(
+            in_features=hidden_dim, out_features=4 * hidden_dim, dtype=dtype, rngs=rngs
+        )
+        self.linear2 = nnx.Linear(
+            in_features=4 * hidden_dim, out_features=hidden_dim, dtype=dtype, rngs=rngs
+        )
+        self.dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
+
+    def __call__(self, x: jax.Array, deterministic: bool = False) -> jax.Array:
+        x = self.linear1(x)
+        x = nnx.gelu(x)
+        x = self.dropout(x, deterministic=deterministic)
+        x = self.linear2(x)
+        x = self.dropout(x, deterministic=deterministic)
+        return x
 
 
 class TransformerBlock(nnx.Module):
@@ -69,17 +130,24 @@ class TransformerBlock(nnx.Module):
         self.attention = nnx.MultiHeadAttention(
             num_heads=num_heads,
             in_features=hidden_dim,
-            qkv_features=hidden_dim // num_heads,
+            qkv_features=hidden_dim,
             dropout_rate=dropout_rate,
             dtype=dtype,
             rngs=rngs,
+            attention_fn=causal_flash_attention_fn,
         )
-        self.layernorm = nnx.LayerNorm(num_features=hidden_dim, dtype=dtype, rngs=rngs)
-        self.linear1 = nnx.Linear(
-            in_features=hidden_dim, out_features=4 * hidden_dim, dtype=dtype, rngs=rngs
+        # self.layernorm1 = nnx.LayerNorm(num_features=hidden_dim, dtype=dtype, rngs=rngs)
+        self.rmsnorm1 = nnx.RMSNorm(
+            num_features=hidden_dim, dtype=dtype, rngs=rngs, use_scale=False
         )
-        self.linear2 = nnx.Linear(
-            in_features=4 * hidden_dim, out_features=hidden_dim, dtype=dtype, rngs=rngs
+
+        self.ffn = FFNBlock(
+            hidden_dim=hidden_dim, dtype=dtype, rngs=rngs, dropout_rate=dropout_rate
+        )
+
+        # self.layernorm2 = nnx.LayerNorm(num_features=hidden_dim, dtype=dtype, rngs=rngs)
+        self.rmsnorm2 = nnx.RMSNorm(
+            num_features=hidden_dim, dtype=dtype, rngs=rngs, use_scale=False
         )
         self.dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
 
@@ -98,17 +166,22 @@ class TransformerBlock(nnx.Module):
         """
 
         # Attention requires ~ B * S^2 * H space, by using remat we do not have to pay an extra factor of L.
-        attn = jax.remat(lambda x, mask: self.attention(x, decode=False, mask=mask, deterministic=deterministic))
+        # TODO: may not need to have mask here, hardcoding causal attention.
+        attn = jax.remat(
+            lambda x, mask: self.attention(
+                x, decode=False, mask=mask, deterministic=deterministic
+            )
+        )
 
-        x = x + attn(x, mask)
-        x = self.layernorm(x)
-        x = self.dropout(x, deterministic=deterministic)
+        y = self.rmsnorm1(x)
+        y = attn(y, mask)
+        y = self.dropout(y)
+        y = x + y
 
-        x = x + self.linear2(nnx.gelu(self.linear1(x)))
-        x = self.layernorm(x)
-        x = self.dropout(x, deterministic=deterministic)
+        z = self.rmsnorm2(y)
+        z = self.ffn(z, deterministic=deterministic)
 
-        return x
+        return y + z
 
 
 class PitchEmbedding(nnx.Module):
@@ -120,8 +193,11 @@ class PitchEmbedding(nnx.Module):
         dtype: jnp.dtype = jnp.float32,
     ):
         seq_len, metadata = sequence_metadata
+        categorical_embedding_dim = 8
 
-        dummy_layer = lambda x: jnp.zeros(x.shape[:-1] + (hidden_dim,))
+        # last dimensions should be hidden_dim, but we set it to 1
+        # so it can be broadcasted even if hidden_dim changes.
+        dummy_layer = lambda x: jnp.zeros(x.shape[:-1] + (1,))
 
         self.embeddings = {}
         for col in metadata:
@@ -129,65 +205,52 @@ class PitchEmbedding(nnx.Module):
             print(col, vocab_sizes, numerical_features)
 
             categorical = [
-                nnx.Embed(num_embeddings=v, features=hidden_dim, rngs=rngs)
+                nnx.Embed(
+                    num_embeddings=v, features=categorical_embedding_dim, rngs=rngs
+                )
                 for v in vocab_sizes
             ]
-            numerical = (
+
+            in_features = 2 * numerical_features + len(vocab_sizes) * (
+                categorical_embedding_dim + 1
+            )
+            linear = (
                 nnx.Linear(
-                    in_features=numerical_features,
+                    in_features=in_features,
                     out_features=hidden_dim,
                     dtype=dtype,
                     rngs=rngs,
                 )
-                if numerical_features > 0
+                if in_features > 0
                 else dummy_layer
             )
 
-            cat_missing = (
-                nnx.Linear(
-                    in_features=len(vocab_sizes),
-                    out_features=hidden_dim,
-                    dtype=dtype,
-                    rngs=rngs,
-                )
-                if len(vocab_sizes) > 0
-                else dummy_layer
-            )
-
-            num_missing = (
-                nnx.Linear(
-                    in_features=numerical_features,
-                    out_features=hidden_dim,
-                    dtype=dtype,
-                    rngs=rngs,
-                )
-                if numerical_features > 0
-                else dummy_layer
-            )
-
-            self.embeddings[col] = categorical, numerical, cat_missing, num_missing
+            self.embeddings[col] = categorical, linear
 
     def __call__(self, batch: sequences.PitchSequences) -> jax.Array:
         xs = {}
         for key in ["pitch_context", "pitcher_outcomes", "batter_outcomes"]:
-            embed_cat, embed_num, embed_cat_missing, embed_num_missing = (
-                self.embeddings[key]
-            )
+            embed_cat, linear = self.embeddings[key]
+
             info = batch[key]
-            xs[key] = (
-                embed_num(info.numerical)
-                + embed_cat_missing(info.categorical_missing_mask)
-                + embed_num_missing(info.numerical_missing_mask)
-            )
+
+            feats = [
+                info.numerical,
+                info.categorical_missing_mask,
+                info.numerical_missing_mask,
+            ]
             for embed_cat1, codes in zip(
                 embed_cat, jnp.moveaxis(info.categorical, -1, 0)
             ):
-                xs[key] = xs[key] + embed_cat1(codes)
+                feats.append(embed_cat1(codes))
+            feats = jnp.concatenate(feats, axis=2)
+
+            xs[key] = linear(feats)
 
         # TODO: replace this with a date-based embedding
-        xs["pitch_context"] += sinusoidal_position_embeddings(
-            batch.sequence_length, xs["pitch_context"].shape[-1]
-        )
+        # xs["pitch_context"] += sinusoidal_position_embeddings(
+        #    batch.sequence_length, xs["pitch_context"].shape[-1]
+        # )
 
         return xs
 
@@ -217,21 +280,29 @@ class OutputHead(nnx.Module):
             out_features=mixture_components,
             dtype=dtype,
             rngs=rngs,
-        ) # if num_numerical_features > 0 else dummy_layer
+        )  # if num_numerical_features > 0 else dummy_layer
 
-        self.numeric_final_means = nnx.Linear(
-            in_features=hidden_dim,
-            out_features=mixture_components * num_numerical_features,
-            dtype=dtype,
-            rngs=rngs,
-        ) if num_numerical_features > 0 else dummy_layer
+        self.numeric_final_means = (
+            nnx.Linear(
+                in_features=hidden_dim,
+                out_features=mixture_components * num_numerical_features,
+                dtype=dtype,
+                rngs=rngs,
+            )
+            if num_numerical_features > 0
+            else dummy_layer
+        )
 
-        self.numeric_final_variances = nnx.Linear(
-            in_features=hidden_dim,
-            out_features=mixture_components * num_numerical_features,
-            dtype=dtype,
-            rngs=rngs,
-        ) if num_numerical_features > 0 else dummy_layer
+        self.numeric_final_variances = (
+            nnx.Linear(
+                in_features=hidden_dim,
+                out_features=mixture_components * num_numerical_features,
+                dtype=dtype,
+                rngs=rngs,
+            )
+            if num_numerical_features > 0
+            else dummy_layer
+        )
 
     def __call__(self, x: jax.Array) -> losses.OutputDistribution:
 
@@ -289,8 +360,15 @@ class Transformer(nnx.Module):
             dtype: Data type for parameters and computations.
             seed: Random seed for initialization.
         """
-        rngs = nnx.Rngs(seed)
+        self.sequence_metadata = sequence_metadata
+        self.rngs = rngs = nnx.Rngs(seed)
         self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.mixture_components = mixture_components
+        self.dropout_rate = dropout_rate
+        self.dtype = dtype
+
         self.embedding = PitchEmbedding(sequence_metadata, hidden_dim, rngs, dtype)
 
         self.blocks = [
@@ -324,13 +402,67 @@ class Transformer(nnx.Module):
             dtype=dtype,
         )
 
+    def grow(
+        self,
+        num_layers: int,
+        hidden_dim: int,
+        num_heads: int,
+        mixture_components: int,
+        new_params_weight: float = 0.0,
+    ) -> "Transformer":
+        curr_layers = len(self.blocks)
+        for _ in range(num_layers - curr_layers):
+            block = TransformerBlock(
+                hidden_dim=self.hidden_dim,
+                num_heads=self.num_heads,
+                rngs=self.rngs,
+                dropout_rate=self.dropout_rate,
+                dtype=self.dtype,
+            )
+            nnx.update(block, jax.tree.map(jnp.zeros_like, nnx.state(block)))
+            self.blocks.append(block)
+
+        new = Transformer(
+            sequence_metadata=self.sequence_metadata,
+            num_layers=num_layers,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            mixture_components=mixture_components,
+            dropout_rate=self.dropout_rate,
+            dtype=self.dtype,
+        )
+
+        foo = functools.partial(pad_and_fill, init_weight=new_params_weight)
+
+        new_state = jax.tree.map(foo, nnx.state(self), nnx.state(new))
+        ratio = (hidden_dim // num_heads) // (self.hidden_dim // self.num_heads)
+
+        ratio2 = hidden_dim // self.hidden_dim
+
+        for i in range(num_layers):
+            # This normalization assumes RMSNorm is used immediately
+            # before the attention layer and the ffn layer
+            leaf = new_state.blocks[i].attention.key["kernel"]
+            leaf.value = leaf.value * ratio**0.25 / jnp.sqrt(ratio2)
+            leaf = new_state.blocks[i].attention.query["kernel"]
+            leaf.value = leaf.value * ratio**0.25 / jnp.sqrt(ratio2)
+            leaf = new_state.blocks[i].attention.value["kernel"]
+            leaf.value = leaf.value / jnp.sqrt(ratio2)
+
+            leaf = new_state.blocks[i].ffn.linear1.kernel
+            leaf.value = leaf.value / jnp.sqrt(ratio2)
+
+        nnx.update(new, new_state)
+
+        return new
+
     def __call__(
         self,
         batch: sequences.PitchSequences,
         mask=None,
         deterministic=False,
     ) -> losses.OutputDistribution:
-        """Compute forward pass for the Transformer model.
+        """Compute forward pass for the Transformer model
 
         Args:
             batch: The input data, including pitch types, features, and context.
@@ -349,9 +481,9 @@ class Transformer(nnx.Module):
 
         # the pitch outcome can depend on the context of the current pitch
         # as well as the context and outcome of all previous pitches.
-        #x = interleave_sequences(
+        # x = interleave_sequences(
         #    xs["pitch_context"], xs["pitcher_outcomes"], xs["batter_outcomes"]
-        #)
+        # )
 
         for layer in self.blocks:
             x = layer(x, mask, deterministic)
@@ -391,9 +523,11 @@ def train_step(
         pitcher_distribution, batter_distribution = model(batch)
         loss1, aux1 = pitcher_distribution.loss_fn(batch.pitcher_outcomes)
         loss2, aux2 = batter_distribution.loss_fn(batch.batter_outcomes)
-        tokens = batch.tokens
-        return (loss1 + loss2) / tokens, (aux1, aux2)
+        loss = (loss1 + loss2) / batch.tokens
+
+        return loss, (loss, aux1, aux2)
 
     (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model, batch)
+
     optimizer.update(grads)
     return aux

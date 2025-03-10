@@ -59,6 +59,9 @@ class PitchInfoBlock:
     def tokens(self):
         return self.categorical_missing_mask.sum() + self.numerical_missing_mask.sum()
 
+    def roll(self, k: int) -> 'PitchInfoBlock':
+        return jax.tree.map(lambda x: jnp.roll(x, k, axis=1), self)
+
     @classmethod
     def from_groups(
         cls,
@@ -83,7 +86,7 @@ class PitchInfoBlock:
             categorical=categorical + 1,
             categorical_missing_mask=categorical != -1,
             numerical=jnp.nan_to_num(numerical),
-            numerical_missing_mask=jnp.isnan(numerical),
+            numerical_missing_mask=~jnp.isnan(numerical),
         )
 
 
@@ -137,6 +140,7 @@ class PitchSequences:
 
         pitches = load.load_pitches(columns=key_cols+categorical_cols+numerical_cols)
 
+        # TOOD: consider splitting this into a separate helper function.
         pitches = normalize_data(pitches, key_cols, categorical_cols, numerical_cols)
 
         groups = pitches.groupby(groupby_key, observed=True)
@@ -164,7 +168,7 @@ class PitchSequences:
 
         return PitchSequences(
             pitch_context=context, pitcher_outcomes=pitcher, batter_outcomes=batter
-        )
+        ), pitches
 
     def metadata(self) -> ...:
         seq_len = self.pitch_context.categorical.shape[1]

@@ -1,16 +1,17 @@
 import jax
 import jax.numpy as jnp
 import argparse
-from bts.models import transformer, sequences
+from bts.models import transformer, sequences, baseline
 from bts.data import load
 import pandas as pd
 import numpy as np
 from flax import nnx
 import optax
 import IPython
+import orbax.checkpoint
 
 # jax.config.update("jax_debug_nans", True)
-jax.config.update("jax_enable_x64", True)
+# jax.config.update("jax_enable_x64", True)
 
 
 def default_params():
@@ -20,15 +21,15 @@ def default_params():
     :returns: a dictionary of default parameter settings for each command line argument
     """
     params = {}
-    params["seq_len"] = 400
+    params["seq_len"] = 4096
     params["hidden_dim"] = 64
     params["num_layers"] = 4
     params["num_heads"] = 4
     params["iterations"] = 1000
-    params["batch_size"] = 8
+    params["batch_size"] = 1
     params["mixture_components"] = 8
-    params["sequence_length"] = 400
     params["learning_rate"] = 1e-4
+    params["checkpoint_path"] = None
 
     return params
 
@@ -43,11 +44,11 @@ if __name__ == "__main__":
     parser.add_argument("--num_heads", type=int, help="number of heads")
     parser.add_argument("--iterations", type=int, help="number of iterations")
     parser.add_argument("--batch_size", type=int, help="batch size")
-    parser.add_argument("--sequence_length", type=int, help="sequence length")
     parser.add_argument(
         "--mixture_components", type=int, help="number of mixture components"
     )
     parser.add_argument("--learning_rate", type=float, help="learning rate")
+    parser.add_argument("--checkpoint_path", type=str, help="checkpoint path")
 
     parser.set_defaults(**default_params())
     args = parser.parse_args()
@@ -91,16 +92,16 @@ if __name__ == "__main__":
     ]
 
     """
-    context_categorical = []
+    context_categorical = ['pitch_type']
     context_numerical = []
-    pitcher_categorical = ["pitch_type"]
-    pitcher_numerical = [] #"plate_x", "plate_z"]
+    pitcher_categorical = ['zone']
+    pitcher_numerical = ["plate_x", "plate_z"]
 
     batter_categorical = [] #"description"]
     batter_numerical = [] #"estimated_ba_using_speedangle"]
     """
 
-    data = sequences.PitchSequences.load(
+    data, pitches = sequences.PitchSequences.load(
         context_categorical,
         context_numerical,
         pitcher_categorical,
@@ -108,8 +109,15 @@ if __name__ == "__main__":
         batter_categorical,
         batter_numerical,
         groupby_key="pitcher",
-        sequence_length=args.sequence_length,
+        sequence_length=args.seq_len,
     )
+
+    baseline_results = baseline.independent_baseline(
+        pitches,
+        categorical_columns=pitcher_categorical + batter_categorical,
+        numerical_columns=pitcher_numerical + batter_numerical,
+    )
+    print(baseline_results)
 
     model = transformer.Transformer(
         sequence_metadata=data.metadata(),
@@ -123,21 +131,69 @@ if __name__ == "__main__":
     total_params = sum(x.size for x in jax.tree.leaves(params))
     print("Model Size: %.2f M" % (total_params / 10**6))
 
-    optimizer = nnx.Optimizer(model, optax.adamw(args.learning_rate, 0.9))
-    pitch_cat_loss = pitch_num_loss = bat_cat_loss = bat_num_loss = 0
+    def make_fresh_optimizer(model):
+        schedule = optax.warmup_cosine_decay_schedule(
+            init_value=0,
+            peak_value=args.learning_rate,
+            warmup_steps=1000,
+            decay_steps=10000,
+        )
 
-    columns=pitcher_categorical+pitcher_numerical+batter_categorical+batter_numerical
+        optax_optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0), optax.adamw(schedule, 0.9)
+        )
+        return nnx.Optimizer(model, optax_optimizer)
+
+    optimizer = make_fresh_optimizer(model)
+
+    columns = (
+        ["total"]
+        + pitcher_categorical
+        + pitcher_numerical
+        + batter_categorical
+        + batter_numerical
+    )
     results = pd.DataFrame(columns=columns, index=range(args.iterations))
 
-    print('\t'.join(columns))
+    print("\t".join(columns))
 
-    for t in range(args.iterations):
-        batch = data.sample(args.batch_size)
-        aux = transformer.train_step(model, optimizer, batch)
-        row = list(aux[0][0]) + list(aux[0][1]) + list(aux[1][0]) + list(aux[1][1])
-        results.loc[t] = [float(x) for x in row]
-        if t % 100 == 99:
-            metrics = results.loc[t-99:t].mean()
-            print('\t'.join(['%.2f' % s for s in metrics.values]))
+    eval_every = 100
+    checkpointer = orbax.checkpoint.PyTreeCheckpointer()
 
-    results.to_csv('results.csv')
+
+    num_layers = args.num_layers
+    hidden_dim = args.hidden_dim
+    num_heads = args.num_heads
+    mixture_components = args.mixture_components
+    for k in range(1):
+        for t in range(args.iterations):
+            batch = data.sample(args.batch_size)
+            loss, aux1, aux2 = transformer.train_step(model, optimizer, batch)
+            row = [loss] + list(aux1[0]) + list(aux1[1]) + list(aux2[0]) + list(aux2[1])
+            results.loc[t] = [float(x) for x in row]
+            if t % eval_every == eval_every - 1:
+                metrics = results.loc[t - eval_every + 1 : t].mean()
+                normalized = (
+                    (metrics - baseline_results).reindex(metrics.index).map(np.exp)
+                )
+                print(normalized)
+                if args.checkpoint_path:
+                    # https://github.com/google/orbax/issues/1105
+                    convert = lambda x: jax.random.key_data(x) if type(x) == type(jax.random.key(0)) else x
+                    state = jax.tree.map(convert, nnx.state(model))
+
+                    checkpointer.save(args.checkpoint_path, state)
+                # print('\t'.join(['%.2f' % s for s in normalized.values]))
+
+        num_layers *= 2
+        hidden_dim *= 2
+        num_heads *= 2
+        mixture_components *= 2
+        model = model.grow(
+            num_layers, hidden_dim, num_heads, mixture_components, new_params_weight=0.1
+        )
+        optimizer = make_fresh_optimizer(model)
+
+    # IPython.embed()
+
+    results.to_csv("results.csv")
